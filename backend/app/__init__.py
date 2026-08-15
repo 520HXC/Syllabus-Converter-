@@ -1,0 +1,1 @@
+"""Syllabus Calendar API package."""

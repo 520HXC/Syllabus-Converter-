@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0A0A0A" />
+    <meta
+      name="description"
+      content="Turn syllabus PDFs into a reviewed semester calendar you can export."
+    />
+    <title>Syllabus Calendar</title>
+    <script>
+      (() => {
+        const storageKey = "syllabus-calendar-theme"
+        const root = document.documentElement
+        let storedTheme = null
+        try {
+          storedTheme = localStorage.getItem(storageKey)
+        } catch {}
+        const theme = storedTheme === "light" || storedTheme === "dark" || storedTheme === "system"
+          ? storedTheme
+          : "system"
+        const prefersDark =
+          typeof window.matchMedia === "function"
+            ? window.matchMedia("(prefers-color-scheme: dark)").matches
+            : false
+        const resolvedTheme = theme === "system" ? (prefersDark ? "dark" : "light") : theme
+        root.dataset.theme = theme
+        root.dataset.resolvedTheme = resolvedTheme
+        root.style.colorScheme = resolvedTheme
+        root.classList.toggle("dark", resolvedTheme === "dark")
+        const metaThemeColor = document.querySelector('meta[name="theme-color"]')
+        if (metaThemeColor) metaThemeColor.setAttribute("content", resolvedTheme === "dark" ? "#0a0a0a" : "#f4f7fb")
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
