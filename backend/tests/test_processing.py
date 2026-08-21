@@ -1985,7 +1985,8 @@ def test_process_job_only_marks_related_relative_no_date_event_as_ambiguous(
         assert "AMBIGUOUS_RECURRENCE" in quick_checks.warning_codes
 
 
-def test_expand_recurring_rules_keeps_unrelated_exact_weekly_rule_even_when_page_has_relative_text():
+def test_expand_recurring_rules_keeps_unrelated_exact_weekly_rule_even_when_page_has_relative_text(
+):
     homework_rule = RecurringRule(
         title="Homework",
         event_type="assignment",

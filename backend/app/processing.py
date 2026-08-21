@@ -323,8 +323,8 @@ def extract_with_openai(
             "a lecture or lab anchor. Set expansion_mode review_only when recurrence wording "
             "is ambiguous or when a relative phrase like morning of the lecture, morning after "
             "the lecture, or Sunday following the lab does not identify every occurrence. "
-            "Otherwise use expansion_mode exact. Use the page markers for source_page. Copy a short exact "
-            "source_quote. Do not invent dates. "
+            "Otherwise use expansion_mode exact. Use the page markers for source_page. "
+            "Copy a short exact source_quote. Do not invent dates. "
             "Mark whether the source explicitly states the year. "
             "Use low confidence and explain uncertainty whenever wording is tentative "
             "or conflicting."
@@ -609,7 +609,11 @@ def _title_variants(title: str) -> set[str]:
 
 
 def _page_sentences(page_text: str) -> list[str]:
-    return [segment.strip() for segment in re.split(r"(?<=[.!?])\s+|\n+", page_text) if segment.strip()]
+    return [
+        segment.strip()
+        for segment in re.split(r"(?<=[.!?])\s+|\n+", page_text)
+        if segment.strip()
+    ]
 
 
 def _related_page_segments(
@@ -767,7 +771,9 @@ def _normalize_ambiguous_recurring_content(
             course_name=extraction.course_name,
             instructor=extraction.instructor,
             events=events,
-            schedule_anchors=[anchor.model_copy(deep=True) for anchor in extraction.schedule_anchors],
+            schedule_anchors=[
+                anchor.model_copy(deep=True) for anchor in extraction.schedule_anchors
+            ],
             recurring_rules=rules,
         ),
         normalized_event_indexes,
@@ -779,7 +785,10 @@ def _detect_missing_recurring_rule(
     extraction: SyllabusExtraction | SyllabusRepair,
     pages: list[dict],
 ) -> list[str]:
-    return [item["stable_title"] for item in _find_missing_recurring_rule_candidates(extraction, pages)]
+    return [
+        item["stable_title"]
+        for item in _find_missing_recurring_rule_candidates(extraction, pages)
+    ]
 
 
 def _find_missing_recurring_rule_candidates(
@@ -1218,7 +1227,8 @@ def _extract_with_model_fallback(
                         uncertainty_reason=None,
                         extraction_model=settings.openai_fallback_model,
                         derivation_summary=(
-                            "Dates were not generated because the syllabus does not identify every occurrence."
+                            "Dates were not generated because the syllabus does not identify "
+                            "every occurrence."
                         ),
                         review_status=ReviewStatus.NEEDS_REVIEW,
                     )
@@ -1233,7 +1243,8 @@ def _extract_with_model_fallback(
                         "source_page": candidate["source_page"],
                         "extraction_model": settings.openai_fallback_model,
                         "derivation_summary": (
-                            "Dates were not generated because the syllabus does not identify every occurrence."
+                            "Dates were not generated because the syllabus does not identify "
+                            "every occurrence."
                         ),
                         "review_status": ReviewStatus.NEEDS_REVIEW,
                     }

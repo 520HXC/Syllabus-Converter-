@@ -26,7 +26,11 @@ def test_production_rejects_development_authentication() -> None:
         production_settings(auth_mode="dev")
 
 
-def test_authentication_defaults_to_supabase_and_fails_closed_without_configuration() -> None:
+def test_authentication_defaults_to_supabase_and_fails_closed_without_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AUTH_MODE", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
     with pytest.raises(ValidationError, match="SUPABASE_URL"):
         Settings(_env_file=None, app_env="development", supabase_url=None)
 
