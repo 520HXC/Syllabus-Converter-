@@ -54,7 +54,7 @@ class CourseRead(BaseModel):
 
 class CourseUpdate(BaseModel):
     code: str | None = Field(default=None, max_length=40)
-    name: str | None = Field(default=None, min_length=1, max_length=200)
+    name: str = Field(default=None, min_length=1, max_length=200)
     instructor: str | None = Field(default=None, max_length=160)
     color: str = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
 

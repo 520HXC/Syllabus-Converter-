@@ -426,6 +426,39 @@ def test_course_details_can_be_corrected_during_review(app_client):
     assert response.json()["instructor"] == "Dr. Rivera"
 
 
+def test_course_name_update_rejects_explicit_null(app_client):
+    client, app = app_client
+    semester_id, _, _ = seed_review_data(app)
+    review = client.get(f"/api/semesters/{semester_id}/review", headers=auth_headers()).json()
+    course_id = review["courses"][0]["id"]
+
+    response = client.patch(
+        f"/api/courses/{course_id}",
+        headers=auth_headers(),
+        json={"name": None},
+    )
+
+    assert response.status_code == 422
+
+
+def test_course_code_and_instructor_can_be_cleared(app_client):
+    client, app = app_client
+    semester_id, _, _ = seed_review_data(app)
+    review = client.get(f"/api/semesters/{semester_id}/review", headers=auth_headers()).json()
+    course = review["courses"][0]
+
+    response = client.patch(
+        f"/api/courses/{course['id']}",
+        headers=auth_headers(),
+        json={"code": None, "instructor": None},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["code"] is None
+    assert response.json()["instructor"] is None
+    assert response.json()["name"] == course["name"]
+
+
 def test_course_color_can_be_corrected_during_review_and_persists(app_client):
     client, app = app_client
     semester_id, _, _ = seed_review_data(app)
