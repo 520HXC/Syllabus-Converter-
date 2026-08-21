@@ -337,6 +337,46 @@ test("optimistically updates the current course visuals and persists the saved c
   expect(screen.getByTestId("course-filter-swatch-course-1")).toHaveStyle({ backgroundColor: "#DC2626" })
 })
 
+test("prevents a second color request for the same course while one is pending and keeps other courses interactive", async () => {
+  const user = userEvent.setup()
+  const firstDeferred = createDeferredCourseUpdate()
+  const secondDeferred = createDeferredCourseUpdate()
+  updateCourseMock
+    .mockImplementationOnce(() => firstDeferred.promise)
+    .mockImplementationOnce(() => secondDeferred.promise)
+  renderCalendarPage()
+
+  expect(await screen.findByRole("heading", { name: "Fall 2026" })).toBeInTheDocument()
+
+  await user.click(screen.getByTestId("course-color-button-course-1"))
+  const courseOnePalette = screen.getByRole("group", { name: "Choose a color for CS 101" })
+  await user.click(within(courseOnePalette).getByRole("button", { name: "Red" }))
+
+  expect(updateCourseMock).toHaveBeenCalledTimes(1)
+  expect(updateCourseMock).toHaveBeenNthCalledWith(1, "course-1", { color: "#DC2626" })
+  expect(screen.getByTestId("course-color-button-course-1")).toBeDisabled()
+  expect(screen.getByTestId("course-color-button-course-1")).toHaveAttribute("aria-busy", "true")
+  for (const colorButton of within(screen.getByRole("group", { name: "Choose a color for CS 101" })).getAllByRole("button")) {
+    expect(colorButton).toBeDisabled()
+  }
+
+  await user.click(within(screen.getByRole("group", { name: "Choose a color for CS 101" })).getByRole("button", { name: "Blue" }))
+  expect(updateCourseMock).toHaveBeenCalledTimes(1)
+
+  const courseTwoButton = screen.getByTestId("course-color-button-course-2")
+  expect(courseTwoButton).toBeEnabled()
+  await user.click(courseTwoButton)
+  await user.click(within(screen.getByRole("group", { name: "Choose a color for MATH 201" })).getByRole("button", { name: "Pink" }))
+  expect(updateCourseMock).toHaveBeenCalledTimes(2)
+  expect(updateCourseMock).toHaveBeenNthCalledWith(2, "course-2", { color: "#DB2777" })
+
+  firstDeferred.resolve({ ...reviewData.courses[0], color: "#DC2626" })
+  secondDeferred.resolve({ ...reviewData.courses[1], color: "#DB2777" })
+
+  await waitFor(() => expect(screen.getByTestId("course-color-button-course-1")).toBeEnabled())
+  await waitFor(() => expect(screen.getByTestId("course-color-button-course-2")).toBeEnabled())
+})
+
 test("rolls back an optimistic color update and shows a course-level alert when the save fails", async () => {
   const user = userEvent.setup()
   const deferred = createDeferredCourseUpdate()
@@ -349,12 +389,17 @@ test("rolls back an optimistic color update and shows a course-level alert when 
   await user.click(within(screen.getByRole("group", { name: "Choose a color for CS 101" })).getByRole("button", { name: "Red" }))
 
   expect(updateCourseMock).toHaveBeenCalledWith("course-1", { color: "#DC2626" })
+  expect(screen.getByTestId("course-color-button-course-1")).toBeDisabled()
+  for (const colorButton of within(screen.getByRole("group", { name: "Choose a color for CS 101" })).getAllByRole("button")) {
+    expect(colorButton).toBeDisabled()
+  }
   expect(screen.getByTestId("course-filter-swatch-course-1")).toHaveStyle({ backgroundColor: "#DC2626" })
 
   deferred.reject(new Error("The course color could not be saved."))
 
   const courseRow = screen.getByTestId("course-filter-row-course-1")
   expect(await within(courseRow).findByRole("alert")).toHaveTextContent("The course color could not be saved.")
+  expect(screen.getByTestId("course-color-button-course-1")).toBeEnabled()
   expect(screen.getByTestId("course-filter-swatch-course-1")).toHaveStyle({ backgroundColor: "#0D9488" })
   expect(screen.getByTestId("calendar-course-rail-this-week-event-1")).toHaveStyle({ backgroundColor: "#0D9488" })
 })

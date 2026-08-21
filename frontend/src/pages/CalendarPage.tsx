@@ -172,7 +172,7 @@ export function CalendarPage() {
   const [selectedCourseIds, setSelectedCourseIds] = useState<Set<string>>(new Set())
   const [initializedCourseFiltersForSemester, setInitializedCourseFiltersForSemester] = useState<string | null>(null)
   const [expandedCourseColorId, setExpandedCourseColorId] = useState<string | null>(null)
-  const [pendingCourseColorId, setPendingCourseColorId] = useState<string | null>(null)
+  const [pendingCourseColorIds, setPendingCourseColorIds] = useState<Set<string>>(new Set())
   const [courseColorErrors, setCourseColorErrors] = useState<Record<string, string>>({})
   const [downloading, setDownloading] = useState(false)
   const [downloadError, setDownloadError] = useState<string | null>(null)
@@ -197,7 +197,7 @@ export function CalendarPage() {
         delete next[courseId]
         return next
       })
-      setPendingCourseColorId(courseId)
+      setPendingCourseColorIds((current) => new Set(current).add(courseId))
       await queryClient.cancelQueries({ queryKey: ["review", semesterId] })
       const previousReview = queryClient.getQueryData<ReviewPayload>(["review", semesterId])
       queryClient.setQueryData<ReviewPayload>(["review", semesterId], (current) =>
@@ -235,7 +235,12 @@ export function CalendarPage() {
       )
     },
     onSettled: (_data, _error, variables) => {
-      setPendingCourseColorId((current) => (current === variables.courseId ? null : current))
+      setPendingCourseColorIds((current) => {
+        const next = new Set(current)
+        next.delete(variables.courseId)
+        return next
+      })
+      setExpandedCourseColorId((current) => (current === variables.courseId ? null : current))
     },
   })
 
@@ -373,7 +378,7 @@ export function CalendarPage() {
   }
 
   function handleCourseColorSelect(courseId: string, color: string) {
-    setExpandedCourseColorId(null)
+    if (pendingCourseColorIds.has(courseId)) return
     courseColorMutation.mutate({ courseId, color })
   }
 
@@ -547,7 +552,7 @@ export function CalendarPage() {
                     const courseColor = courseDisplayColors.get(course.id) ?? course.color
                     const courseColorError = courseColorErrors[course.id]
                     const isPickerOpen = expandedCourseColorId === course.id
-                    const isSavingColor = pendingCourseColorId === course.id
+                    const isSavingColor = pendingCourseColorIds.has(course.id)
 
                     return (
                       <div
@@ -560,14 +565,16 @@ export function CalendarPage() {
                           <div className="relative shrink-0">
                             <button
                               aria-controls={isPickerOpen ? `course-color-picker-${course.id}` : undefined}
+                              aria-busy={isSavingColor || undefined}
                               aria-expanded={isPickerOpen}
                               aria-haspopup="dialog"
                               aria-label={`Change color for ${courseLabel}`}
                               className={cn(
-                                "inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 bg-panel px-3 transition-colors hover:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
+                                "inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 bg-panel px-3 transition-colors hover:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app disabled:cursor-not-allowed disabled:opacity-60",
                                 isPickerOpen && "border-accent text-accent",
                               )}
                               data-testid={`course-color-button-${course.id}`}
+                              disabled={isSavingColor}
                               onClick={() => toggleCourseColorPalette(course.id)}
                               type="button"
                             >
@@ -581,6 +588,7 @@ export function CalendarPage() {
                             {isPickerOpen ? (
                               <div
                                 aria-label={`Choose a color for ${courseLabel}`}
+                                aria-busy={isSavingColor || undefined}
                                 className="absolute left-0 z-20 mt-2 w-[min(15rem,calc(100vw-2rem))] rounded-2xl border border-border/80 bg-panel p-3 shadow-panel sm:left-auto sm:right-0"
                                 id={`course-color-picker-${course.id}`}
                                 role="group"
@@ -592,9 +600,10 @@ export function CalendarPage() {
                                       <button
                                         aria-label={choice.name}
                                         className={cn(
-                                          "relative inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
+                                          "relative inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app disabled:cursor-not-allowed disabled:opacity-60",
                                           isActive && "ring-2 ring-focus ring-offset-2 ring-offset-panel",
                                         )}
+                                        disabled={isSavingColor}
                                         key={choice.value}
                                         onClick={() => handleCourseColorSelect(course.id, choice.value)}
                                         style={{ backgroundColor: choice.value }}
