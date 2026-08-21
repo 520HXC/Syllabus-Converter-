@@ -594,11 +594,60 @@ def _page_text(source_page: int, pages: list[dict]) -> str:
     return next((page["text"] for page in pages if page["page"] == source_page), "")
 
 
+def _normalize_phrase(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _title_variants(title: str) -> set[str]:
+    display = _display_title(title)
+    tokens = [token for token in _normalize_phrase(display).split() if token]
+    if not tokens:
+        return set()
+    singular_tokens = [token[:-1] if token.endswith("s") else token for token in tokens]
+    variants = {" ".join(tokens), " ".join(singular_tokens)}
+    return {variant for variant in variants if variant}
+
+
+def _page_sentences(page_text: str) -> list[str]:
+    return [segment.strip() for segment in re.split(r"(?<=[.!?])\s+|\n+", page_text) if segment.strip()]
+
+
+def _related_page_segments(
+    *,
+    title: str,
+    source_page: int,
+    source_quote: str,
+    pages: list[dict],
+) -> list[str]:
+    page_text = _page_text(source_page, pages)
+    if not page_text:
+        return []
+    normalized_quote = _normalize_phrase(source_quote)
+    title_variants = _title_variants(title)
+    segments: list[str] = []
+    for sentence in _page_sentences(page_text):
+        normalized_sentence = _normalize_phrase(sentence)
+        if normalized_quote and normalized_quote in normalized_sentence:
+            segments.append(sentence)
+            continue
+        if any(variant and variant in normalized_sentence for variant in title_variants):
+            segments.append(sentence)
+    return segments
+
+
+def _has_relative_review_only_phrase(value: str) -> bool:
+    return bool(RELATIVE_REVIEW_ONLY_PATTERN.search(value))
+
+
 def _rule_requires_review_only(rule: RecurringRule, pages: list[dict]) -> bool:
-    page_text = _page_text(rule.source_page, pages)
-    has_relative_phrase = bool(
-        RELATIVE_REVIEW_ONLY_PATTERN.search(rule.source_quote)
-        or RELATIVE_REVIEW_ONLY_PATTERN.search(page_text)
+    related_segments = _related_page_segments(
+        title=rule.title,
+        source_page=rule.source_page,
+        source_quote=rule.source_quote,
+        pages=pages,
+    )
+    has_relative_phrase = _has_relative_review_only_phrase(rule.source_quote) or any(
+        _has_relative_review_only_phrase(segment) for segment in related_segments
     )
     if rule.expansion_mode == "review_only":
         return True
@@ -606,23 +655,35 @@ def _rule_requires_review_only(rule: RecurringRule, pages: list[dict]) -> bool:
         return True
     if rule.rule_kind == "relative_to_anchor" and has_relative_phrase:
         return True
-    if has_relative_phrase and _is_ambiguous_recurrence_text(page_text):
+    if has_relative_phrase and any(
+        _is_ambiguous_recurrence_text(segment) for segment in related_segments
+    ):
         return True
-    if _is_ambiguous_recurrence_text(page_text) and rule.rule_kind == "weekly_fixed":
+    if rule.rule_kind == "weekly_fixed" and any(
+        _is_ambiguous_recurrence_text(segment) for segment in related_segments
+    ):
         return True
     return False
 
 
 def _event_requires_review_only(event: CandidateEvent, pages: list[dict]) -> bool:
-    page_text = _page_text(event.source_page, pages)
-    has_relative_phrase = bool(
-        RELATIVE_REVIEW_ONLY_PATTERN.search(event.source_quote)
-        or RELATIVE_REVIEW_ONLY_PATTERN.search(page_text)
+    related_segments = _related_page_segments(
+        title=event.title,
+        source_page=event.source_page,
+        source_quote=event.source_quote,
+        pages=pages,
+    )
+    has_relative_phrase = _has_relative_review_only_phrase(event.source_quote) or any(
+        _has_relative_review_only_phrase(segment) for segment in related_segments
     )
     return bool(
-        _is_ambiguous_recurrence_text(event.source_quote)
-        or has_relative_phrase
-        or (has_relative_phrase and _is_ambiguous_recurrence_text(page_text))
+        has_relative_phrase
+        and (
+            _is_ambiguous_recurrence_text(event.source_quote)
+            or any(
+            _is_ambiguous_recurrence_text(segment) for segment in related_segments
+            )
+        )
     )
 
 

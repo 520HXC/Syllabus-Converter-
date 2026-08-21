@@ -1870,6 +1870,182 @@ def test_process_job_materializes_review_only_rule_without_existing_event(
         assert "AMBIGUOUS_RECURRENCE" in event.warning_codes
 
 
+def test_process_job_only_marks_related_relative_no_date_event_as_ambiguous(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 19),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="fall2025.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/fall2025.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf(
+            "Quick Checks - 8AM the morning of the lecture. "
+            "Final exam as scheduled by Registrar. " * 4
+        )
+    )
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Final exam",
+                event_type="exam",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Final exam as scheduled by Registrar",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+            )
+        ],
+        recurring_rules=[
+            RecurringRule(
+                title="Quick Checks",
+                event_type="quiz",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=time(8, 0),
+                end_time=None,
+                is_all_day=False,
+                boundary_start=date(2025, 8, 25),
+                boundary_end=date(2025, 12, 19),
+                exclusion_dates=[],
+                source_quote="Quick Checks - 8AM the morning of the lecture",
+                source_page=1,
+                confidence="high",
+                anchor_title="Lecture",
+                offset_days=0,
+                uncertainty_reason=None,
+            )
+        ],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            return SimpleNamespace(output_parsed=luna_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        events = sorted(persisted.document.semester.events, key=lambda item: item.title)
+        assert [event.title for event in events] == ["Final exam", "Quick Checks"]
+        final_exam = next(event for event in events if event.title == "Final exam")
+        quick_checks = next(event for event in events if event.title == "Quick Checks")
+        assert "AMBIGUOUS_RECURRENCE" not in final_exam.warning_codes
+        assert "AMBIGUOUS_RECURRENCE" in quick_checks.warning_codes
+
+
+def test_expand_recurring_rules_keeps_unrelated_exact_weekly_rule_even_when_page_has_relative_text():
+    homework_rule = RecurringRule(
+        title="Homework",
+        event_type="assignment",
+        rule_kind="weekly_fixed",
+        weekday="friday",
+        start_time=None,
+        end_time=None,
+        is_all_day=True,
+        boundary_start=date(2026, 9, 4),
+        boundary_end=date(2026, 9, 18),
+        exclusion_dates=[],
+        source_quote="Homework is due every Friday from Sep 4, 2026 through Sep 18, 2026",
+        source_page=1,
+        confidence="high",
+        anchor_title=None,
+        offset_days=None,
+        uncertainty_reason=None,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[homework_rule],
+    )
+    pages = [
+        {
+            "page": 1,
+            "ocr": False,
+            "text": (
+                "Quick Checks - 8AM the morning of the lecture. "
+                "Nearly every topic includes a quick check. "
+                "Homework is due every Friday from Sep 4, 2026 through Sep 18, 2026."
+            ),
+        }
+    ]
+
+    normalized, _, _ = processing._normalize_ambiguous_recurring_content(extraction, pages)
+    series, derived_events = expand_recurring_rules(
+        anchors=[],
+        rules=normalized.recurring_rules,
+        semester_start=date(2026, 9, 1),
+        semester_end=date(2026, 9, 30),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert normalized.recurring_rules[0].expansion_mode == "exact"
+    assert len(series) == 1
+    assert [event.event_date for event in derived_events] == [
+        date(2026, 9, 4),
+        date(2026, 9, 11),
+        date(2026, 9, 18),
+    ]
+
+
 def test_process_job_marks_unresolved_deterministic_rule_after_single_terra_repair(
     app_client, monkeypatch
 ):
@@ -2022,12 +2198,13 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
         make_pdf(
             "Project Proposal September 12, 2025. Midterm 1 October 3, 2025. "
             "Midterm 2 November 7, 2025. Final Presentation December 5, 2025. "
+            "Final exam as scheduled by Registrar. "
             "Quick Checks - 8AM the morning of the lecture. "
             "Exercise Sets - 8AM the morning after the lecture. "
             "Nearly every topic includes a quick check and exercise set. "
             "Lab Exams are scheduled periodically. "
-            "Lab Exam Makeups may be scheduled separately. "
-            "Lab Makeups - 11:59PM the Sunday following the lab."
+            "Lab assignment make-up deadline as scheduled by course staff. "
+            "Lab assignment make-up deadline - 11:59PM the Sunday following the lab."
         )
     )
 
@@ -2088,6 +2265,45 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
                 year_was_explicit=True,
                 uncertainty_reason=None,
             ),
+            CandidateEvent(
+                title="Final exam",
+                event_type="exam",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Final exam as scheduled by Registrar",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+            ),
+            CandidateEvent(
+                title="Lab assignment make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Lab assignment make-up deadline as scheduled by course staff",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+            ),
+            CandidateEvent(
+                title="Lab Exams",
+                event_type="exam",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Lab Exams are scheduled periodically",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+            ),
         ],
         recurring_rules=[
             RecurringRule(
@@ -2124,60 +2340,6 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
                 confidence="high",
                 anchor_title="Lecture",
                 offset_days=1,
-                uncertainty_reason=None,
-            ),
-            RecurringRule(
-                title="Lab Exams",
-                event_type="exam",
-                rule_kind="weekly_fixed",
-                weekday="friday",
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                boundary_start=date(2025, 8, 25),
-                boundary_end=date(2025, 12, 19),
-                exclusion_dates=[],
-                source_quote="Lab Exams are scheduled periodically",
-                source_page=1,
-                confidence="high",
-                anchor_title=None,
-                offset_days=None,
-                uncertainty_reason=None,
-            ),
-            RecurringRule(
-                title="Lab Exam Makeups",
-                event_type="exam",
-                rule_kind="weekly_fixed",
-                weekday="friday",
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                boundary_start=date(2025, 8, 25),
-                boundary_end=date(2025, 12, 19),
-                exclusion_dates=[],
-                source_quote="Lab Exam Makeups may be scheduled separately",
-                source_page=1,
-                confidence="high",
-                anchor_title=None,
-                offset_days=None,
-                uncertainty_reason=None,
-            ),
-            RecurringRule(
-                title="Lab Makeups",
-                event_type="deadline",
-                rule_kind="relative_to_anchor",
-                weekday=None,
-                start_time=time(23, 59),
-                end_time=None,
-                is_all_day=False,
-                boundary_start=date(2025, 8, 25),
-                boundary_end=date(2025, 12, 19),
-                exclusion_dates=[],
-                source_quote="Lab Makeups - 11:59PM the Sunday following the lab",
-                source_page=1,
-                confidence="high",
-                anchor_title="Lab",
-                offset_days=4,
                 uncertainty_reason=None,
             ),
         ],
@@ -2218,9 +2380,25 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
         ).count()
         assert len(dated_events) == 4
         assert len(review_events) == 5
+        assert [event.title for event in dated_events] == [
+            "Final Presentation",
+            "Midterm 1",
+            "Midterm 2",
+            "Project Proposal",
+        ]
+        assert [event.title for event in review_events] == [
+            "Exercise Sets",
+            "Final exam",
+            "Lab Exams",
+            "Lab assignment make-up deadline",
+            "Quick Checks",
+        ]
         assert series_count == 0
         assert all(event.recurring_series_id is None for event in review_events)
-        assert all("AMBIGUOUS_RECURRENCE" in event.warning_codes for event in review_events)
+        ambiguous_titles = {
+            event.title for event in review_events if "AMBIGUOUS_RECURRENCE" in event.warning_codes
+        }
+        assert ambiguous_titles == {"Exercise Sets", "Quick Checks"}
 
     assert calls == ["gpt-5.6-luna"]
 
