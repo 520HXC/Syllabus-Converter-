@@ -251,6 +251,19 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   await expect(page.getByTestId(/course-filter-swatch-/).nth(1)).toHaveCSS("background-color", "rgb(219, 39, 119)")
   await expect(page.getByTestId(/calendar-course-rail-list-/).first()).toHaveCSS("background-color", "rgb(219, 39, 119)")
 
+  await page.setViewportSize({ width: 1280, height: 720 })
+  await mathColorButton.click()
+  const desktopPaletteBox = await page
+    .getByRole("group", { name: "Choose a color for MATH 201" })
+    .boundingBox()
+  const desktopMainBox = await page.locator("main").boundingBox()
+  expect(desktopPaletteBox).not.toBeNull()
+  expect(desktopMainBox).not.toBeNull()
+  expect(desktopPaletteBox!.x).toBeGreaterThanOrEqual(desktopMainBox!.x)
+  expect(desktopPaletteBox!.x + desktopPaletteBox!.width).toBeLessThanOrEqual(1280)
+  await page.keyboard.press("Escape")
+  await page.setViewportSize({ width: 375, height: 812 })
+
   await page.getByRole("navigation", { name: "Mobile navigation" }).getByRole("link", { name: "Review", exact: true }).click()
   await expect(page).toHaveURL(/\/review$/)
   await expect(page.getByText("Review complete")).toBeVisible()

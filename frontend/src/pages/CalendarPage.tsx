@@ -589,7 +589,7 @@ export function CalendarPage() {
                               <div
                                 aria-label={`Choose a color for ${courseLabel}`}
                                 aria-busy={isSavingColor || undefined}
-                                className="absolute left-0 z-20 mt-2 w-[min(15rem,calc(100vw-2rem))] rounded-2xl border border-border/80 bg-panel p-3 shadow-panel sm:left-auto sm:right-0"
+                                className="absolute left-0 z-20 mt-2 w-[min(15rem,calc(100vw-2rem))] rounded-2xl border border-border/80 bg-panel p-3 shadow-panel"
                                 id={`course-color-picker-${course.id}`}
                                 role="group"
                               >
