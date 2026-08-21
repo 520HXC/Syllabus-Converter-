@@ -367,6 +367,69 @@ test("shows fallback attention copy when a review warning has no reason text", (
   ).toBeInTheDocument()
 })
 
+test("shows a recurring rule badge and fixed copy for ambiguous recurrence warnings", () => {
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        warning_codes: ["AMBIGUOUS_RECURRENCE"],
+        warning_reason: "This generic warning should be replaced.",
+      }}
+      onSave={vi.fn()}
+      {...defaultProps}
+    />,
+  )
+
+  expect(screen.getByText("Recurring rule")).toBeInTheDocument()
+  expect(
+    screen.getByText("Dates were not generated because the syllabus does not identify every occurrence"),
+  ).toBeInTheDocument()
+  expect(screen.queryByText("This generic warning should be replaced.")).not.toBeInTheDocument()
+})
+
+test("treats ambiguous recurrence as a date-focused review warning", async () => {
+  const user = userEvent.setup()
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        warning_codes: ["AMBIGUOUS_RECURRENCE"],
+        warning_reason: null,
+      }}
+      onSave={vi.fn()}
+      {...defaultProps}
+    />,
+  )
+
+  await user.click(screen.getByRole("button", { name: "Modify Final project" }))
+  const dateField = screen.getByLabelText("Event date")
+  const describedBy = dateField.getAttribute("aria-describedby")
+
+  expect(describedBy).toBeTruthy()
+  expect(describedBy).toContain("review-warning")
+})
+
+test("explains why dates were not generated instead of showing a calculated date title", () => {
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        derivation_summary: "Quick Checks are due the morning of the lecture, but the syllabus does not list every lecture date.",
+        warning_codes: ["AMBIGUOUS_RECURRENCE"],
+        warning_reason: null,
+      }}
+      onSave={vi.fn()}
+      {...defaultProps}
+    />,
+  )
+
+  expect(screen.getByText("Why dates were not generated")).toBeInTheDocument()
+  expect(screen.queryByText("Calculated date")).not.toBeInTheDocument()
+})
+
 test("maps a missing date warning to the date field accessibility description", async () => {
   const user = userEvent.setup()
   render(

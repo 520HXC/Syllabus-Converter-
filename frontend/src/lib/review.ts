@@ -2,6 +2,7 @@ export type ReviewAttentionTarget = "date" | "source" | "card"
 
 const dateWarningCodes = new Set([
   "AMBIGUOUS_DATE",
+  "AMBIGUOUS_RECURRENCE",
   "DATE_MISSING",
   "DATE_CONFLICT",
   "OUTSIDE_SEMESTER",
@@ -17,5 +18,8 @@ export function getReviewAttentionTarget(warningCodes: string[]): ReviewAttentio
 }
 
 export function getReviewFallbackMessage(warningCodes: string[]): string {
+  if (warningCodes.includes("AMBIGUOUS_RECURRENCE")) {
+    return "Dates were not generated because the syllabus does not identify every occurrence"
+  }
   return "Review this AI extracted event before continuing"
 }

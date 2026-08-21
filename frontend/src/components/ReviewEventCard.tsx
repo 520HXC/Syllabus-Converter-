@@ -8,6 +8,7 @@ import {
   Clock3,
   FileText,
   PencilLine,
+  Repeat,
   Save,
   Trash2,
   X,
@@ -81,6 +82,10 @@ function getStatusChip(event: ExtractedEvent) {
   }
 }
 
+function hasAmbiguousRecurrenceWarning(warningCodes: string[]) {
+  return warningCodes.includes("AMBIGUOUS_RECURRENCE")
+}
+
 export function ReviewEventCard({
   event,
   courseLabel,
@@ -116,7 +121,10 @@ export function ReviewEventCard({
   const [errorTarget, setErrorTarget] = useState<"date" | "general">("general")
 
   const attentionTarget = getReviewAttentionTarget(event.warning_codes)
-  const warningMessage = event.warning_reason ?? getReviewFallbackMessage(event.warning_codes)
+  const hasAmbiguousRecurrence = hasAmbiguousRecurrenceWarning(event.warning_codes)
+  const warningMessage = hasAmbiguousRecurrence
+    ? getReviewFallbackMessage(event.warning_codes)
+    : event.warning_reason ?? getReviewFallbackMessage(event.warning_codes)
   const isNeedsReview = event.review_status === "needs_review"
   const dateError = errorTarget === "date" ? error : null
   const generalError = errorTarget === "general" ? error : null
@@ -247,6 +255,12 @@ export function ReviewEventCard({
             <Badge className={cn("border", getConfidenceBadgeClass(event.confidence))}>
               {formatConfidence(event.confidence)}
             </Badge>
+            {hasAmbiguousRecurrence ? (
+              <Badge className="border border-warning-border bg-warning-soft text-warning">
+                <Repeat aria-hidden="true" className="mr-1 size-3.5" />
+                Recurring rule
+              </Badge>
+            ) : null}
             <Badge className={statusChip.className}>{statusChip.copy}</Badge>
             {event.extraction_model ? (
               <Badge className="border border-border bg-panel text-text-muted">
@@ -321,7 +335,9 @@ export function ReviewEventCard({
 
         {event.derivation_summary ? (
           <div className="rounded-xl border border-accent/20 bg-accent/10 px-3.5 py-3 text-sm text-text-muted">
-            <p className="font-semibold text-text">Calculated date</p>
+            <p className="font-semibold text-text">
+              {hasAmbiguousRecurrence ? "Why dates were not generated" : "Calculated date"}
+            </p>
             <p className="mt-1 leading-6">{event.derivation_summary}</p>
           </div>
         ) : null}
