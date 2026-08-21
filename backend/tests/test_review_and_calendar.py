@@ -426,6 +426,64 @@ def test_course_details_can_be_corrected_during_review(app_client):
     assert response.json()["instructor"] == "Dr. Rivera"
 
 
+def test_course_color_can_be_corrected_during_review_and_persists(app_client):
+    client, app = app_client
+    semester_id, _, _ = seed_review_data(app)
+    review = client.get(f"/api/semesters/{semester_id}/review", headers=auth_headers()).json()
+    course = review["courses"][0]
+
+    response = client.patch(
+        f"/api/courses/{course['id']}",
+        headers=auth_headers(),
+        json={"color": "#2563EB"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["color"] == "#2563EB"
+    assert response.json()["code"] == course["code"]
+    assert response.json()["name"] == course["name"]
+    assert response.json()["instructor"] == course["instructor"]
+
+    refreshed_review = client.get(
+        f"/api/semesters/{semester_id}/review",
+        headers=auth_headers(),
+    )
+
+    assert refreshed_review.status_code == 200
+    assert refreshed_review.json()["courses"][0]["color"] == "#2563EB"
+
+
+@pytest.mark.parametrize("payload", [{"color": None}, {"color": "2563EB"}, {"color": "#2563eb"}])
+def test_course_color_update_rejects_null_and_invalid_values(app_client, payload):
+    client, app = app_client
+    semester_id, _, _ = seed_review_data(app)
+    review = client.get(f"/api/semesters/{semester_id}/review", headers=auth_headers()).json()
+    course_id = review["courses"][0]["id"]
+
+    response = client.patch(
+        f"/api/courses/{course_id}",
+        headers=auth_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 422
+
+
+def test_other_user_cannot_patch_course(app_client):
+    client, app = app_client
+    semester_id, _, _ = seed_review_data(app)
+    review = client.get(f"/api/semesters/{semester_id}/review", headers=auth_headers()).json()
+    course_id = review["courses"][0]["id"]
+
+    response = client.patch(
+        f"/api/courses/{course_id}",
+        headers=auth_headers(USER_B),
+        json={"color": "#2563EB"},
+    )
+
+    assert response.status_code == 404
+
+
 def test_review_exposes_evidence_and_allows_confirm_or_ignore(app_client):
     client, app = app_client
     semester_id, _, event_id = seed_review_data(app)
@@ -642,6 +700,54 @@ def test_reprocess_job_replaces_events_and_resets_review_complete_on_success(
         semester = session.get(Semester, semester_id)
         titles = [event.title for event in session.query(ExtractedEvent).all()]
         assert titles == ["New midterm"]
+        assert semester.review_completed_at is None
+
+
+def test_reprocess_job_preserves_an_existing_course_color(app_client, monkeypatch):
+    client, app = app_client
+    semester_id, job_id, document_id, storage_key = seed_reprocess_data(app)
+    upload_root = Path(app.state.settings.local_storage_path)
+    file_path = upload_root / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(make_pdf("CS 101 Midterm exam October 14, 2026. " * 8))
+
+    with app.state.session_factory() as session:
+        course = session.query(Course).filter(Course.semester_id == semester_id).one()
+        course.document_id = document_id
+        course.color = "#F97316"
+        session.commit()
+
+    monkeypatch.setattr(
+        "app.processing.extract_syllabus",
+        lambda pages, settings: SyllabusExtraction(
+            course_code="CS 101",
+            course_name="Introduction to Computer Science",
+            instructor="Dr. Rivera",
+            events=[
+                CandidateEvent(
+                    title="New midterm",
+                    event_type="exam",
+                    event_date=date(2026, 10, 14),
+                    start_time=None,
+                    end_time=None,
+                    is_all_day=True,
+                    source_quote="Midterm exam October 14, 2026",
+                    source_page=1,
+                    confidence="high",
+                    year_was_explicit=True,
+                    uncertainty_reason=None,
+                )
+            ],
+        ),
+    )
+
+    response = client.post(f"/api/jobs/{job_id}/reprocess", headers=auth_headers())
+
+    assert response.status_code == 200
+    with app.state.session_factory() as session:
+        course = session.query(Course).filter(Course.document_id == document_id).one()
+        semester = session.get(Semester, semester_id)
+        assert course.color == "#F97316"
         assert semester.review_completed_at is None
 
 
