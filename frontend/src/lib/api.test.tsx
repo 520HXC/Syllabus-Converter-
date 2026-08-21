@@ -94,3 +94,28 @@ test("starts an explicit reprocess without treating the response as empty", asyn
     expect.objectContaining({ method: "POST" }),
   )
 })
+
+test("updateCourse accepts a partial color-only payload", async () => {
+  const fetchMock = vi.fn(async () =>
+    new Response(JSON.stringify({ id: "course-1", color: "#2563EB" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  )
+  vi.stubGlobal("fetch", fetchMock)
+  let apiRef: ReturnType<typeof useApi> | null = null
+
+  render(<ApiHarness onReady={(api) => { apiRef = api }} />)
+  await waitFor(() => expect(apiRef).not.toBeNull())
+
+  await expect(apiRef!.updateCourse("course-1", { color: "#2563EB" })).resolves.toEqual(
+    expect.objectContaining({ id: "course-1", color: "#2563EB" }),
+  )
+  expect(fetchMock).toHaveBeenCalledWith(
+    "http://localhost:8000/api/courses/course-1",
+    expect.objectContaining({
+      method: "PATCH",
+      body: JSON.stringify({ color: "#2563EB" }),
+    }),
+  )
+})

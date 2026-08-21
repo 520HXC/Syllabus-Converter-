@@ -29,6 +29,7 @@ import { getReviewAttentionTarget } from "../lib/review"
 import { useSemester } from "../lib/semester"
 import type {
   Course,
+  CourseUpdatePayload,
   EventUpdate,
   ExtractedEvent,
   ReviewBlockingDetail,
@@ -125,7 +126,7 @@ export function ReviewPage() {
     mutationFn: ({ id, update }: { id: string; update: EventUpdate }) => api.updateEvent(id, update),
   })
   const courseMutation = useMutation({
-    mutationFn: ({ id, values }: { id: string; values: Pick<Course, "code" | "name" | "instructor"> }) =>
+    mutationFn: ({ id, values }: { id: string; values: CourseUpdatePayload }) =>
       api.updateCourse(id, values),
   })
   const recurringSeriesMutation = useMutation({
@@ -355,7 +356,7 @@ export function ReviewPage() {
     }
   }
 
-  async function saveCourse(id: string, values: Pick<Course, "code" | "name" | "instructor">) {
+  async function saveCourse(id: string, values: CourseUpdatePayload) {
     const updatedCourse = await courseMutation.mutateAsync({ id, values })
     queryClient.setQueryData<ReviewPayload>(["review", semesterId], (current) =>
       current

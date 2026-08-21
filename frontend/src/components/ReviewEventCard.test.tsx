@@ -105,11 +105,15 @@ test("uses semantic confidence colors at both ends of the confidence scale", () 
 
 test.each([
   ["assignment", "text-event-assignment"],
+  ["class", "text-event-class"],
+  ["deadline", "text-event-deadline"],
   ["quiz", "text-event-quiz"],
   ["project", "text-event-project"],
+  ["reading", "text-event-reading"],
   ["lecture", "text-event-lecture"],
   ["presentation", "text-event-presentation"],
   ["meeting", "text-event-meeting"],
+  ["other", "text-event-other"],
 ])("uses a stable semantic color for %s events", (eventType, expectedClass) => {
   render(
     <ReviewEventCard
@@ -120,6 +124,18 @@ test.each([
   )
 
   expect(screen.getByText(eventType)).toHaveClass(expectedClass)
+})
+
+test("shows a neutral fallback for an unknown event type label", () => {
+  render(
+    <ReviewEventCard
+      event={{ ...event, event_type: "capstone" }}
+      onSave={vi.fn()}
+      {...defaultProps}
+    />,
+  )
+
+  expect(screen.getByText("unknown")).toHaveClass("border-border", "bg-panel-muted/70", "text-text-muted")
 })
 
 test("modifies the title and date inline without changing review status", async () => {
@@ -183,6 +199,13 @@ test("keeps advanced fields behind More options", async () => {
 
   await user.click(screen.getByRole("button", { name: "More options" }))
   expect(screen.getByLabelText("Event type")).toHaveValue("project")
+  const suggestionValues = Array.from(
+    document.querySelectorAll<HTMLOptionElement>("#review-event-type-options option"),
+  ).map((option) => option.value)
+  expect(suggestionValues).toContain("class")
+  expect(suggestionValues).toContain("deadline")
+  expect(suggestionValues).toContain("reading")
+  expect(suggestionValues).toContain("other")
   expect(screen.getByLabelText("Start time")).toHaveValue("09:00")
   expect(screen.getByLabelText("End time")).toHaveValue("10:15")
 })

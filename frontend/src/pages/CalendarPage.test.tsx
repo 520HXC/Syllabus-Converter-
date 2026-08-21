@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { render, screen, waitFor } from "@testing-library/react"
+import { render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom"
 
@@ -414,11 +414,13 @@ test("uses the natural Monday through Sunday window for This week", async () => 
 
   renderCalendarPage()
 
-  expect(await screen.findByRole("heading", { name: "This week" })).toBeInTheDocument()
-  expect(screen.getByText(formatWeekRangeFromDates(monday, sunday))).toBeInTheDocument()
-  expect(screen.getByText("Monday recap")).toBeInTheDocument()
-  expect(screen.getByText("Sunday workshop")).toBeInTheDocument()
-  expect(screen.queryByText("Next Monday kickoff")).not.toBeInTheDocument()
+  const thisWeekHeading = await screen.findByRole("heading", { name: "This week" })
+  const thisWeekSection = thisWeekHeading.parentElement?.parentElement
+  expect(thisWeekSection).not.toBeNull()
+  expect(within(thisWeekSection as HTMLElement).getByText(formatWeekRangeFromDates(monday, sunday))).toBeInTheDocument()
+  expect(within(thisWeekSection as HTMLElement).getByText("Monday recap")).toBeInTheDocument()
+  expect(within(thisWeekSection as HTMLElement).getByText("Sunday workshop")).toBeInTheDocument()
+  expect(within(thisWeekSection as HTMLElement).queryByText("Next Monday kickoff")).not.toBeInTheDocument()
 })
 
 test("computes the current natural week in the semester timezone instead of browser local time", () => {

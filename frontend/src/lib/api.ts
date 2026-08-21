@@ -3,6 +3,7 @@ import { useMemo } from "react"
 import { useAuth } from "./auth"
 import type {
   Course,
+  CourseUpdatePayload,
   EventUpdate,
   ExtractedEvent,
   ProcessingJob,
@@ -132,7 +133,7 @@ export function useApi() {
           method: "PATCH",
           body: JSON.stringify(payload),
         }),
-      updateCourse: (courseId: string, payload: Pick<Course, "code" | "name" | "instructor">) =>
+      updateCourse: (courseId: string, payload: CourseUpdatePayload) =>
         request<Course>(`/courses/${courseId}`, { method: "PATCH", body: JSON.stringify(payload) }),
       completeReview: (semesterId: string) =>
         request<ReviewCompleteResponse | ReviewBlockingDetail>(

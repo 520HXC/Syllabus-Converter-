@@ -34,6 +34,8 @@ export interface Course {
   color: string
 }
 
+export type CourseUpdatePayload = Partial<Pick<Course, "code" | "name" | "instructor" | "color">>
+
 export interface SyllabusDocument {
   id: string
   filename: string

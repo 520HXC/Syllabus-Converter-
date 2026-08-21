@@ -13,8 +13,9 @@ import {
   X,
 } from "lucide-react"
 
+import { EventTypeBadge } from "./EventTypeBadge"
 import { formatFallbackReasons } from "../lib/modelRouting"
-import { getConfidenceBadgeClass, getEventTypeBadgeClass } from "../lib/reviewBadges"
+import { getConfidenceBadgeClass } from "../lib/reviewBadges"
 import { getReviewAttentionTarget, getReviewFallbackMessage } from "../lib/review"
 import type { EventUpdate, ExtractedEvent, ReviewStatus } from "../lib/types"
 import { cn } from "../lib/utils"
@@ -27,12 +28,16 @@ type SaveAction = ReviewStatus | "changes"
 
 const eventTypeSuggestions = [
   "assignment",
+  "class",
+  "deadline",
   "exam",
   "lecture",
   "meeting",
+  "other",
   "presentation",
   "project",
   "quiz",
+  "reading",
 ]
 
 function formatConfidence(confidence: ExtractedEvent["confidence"]) {
@@ -238,9 +243,7 @@ export function ReviewEventCard({
             >
               {courseLabel}
             </Badge>
-            <Badge className={cn("border", getEventTypeBadgeClass(event.event_type))}>
-              {event.event_type}
-            </Badge>
+            <EventTypeBadge eventType={event.event_type} />
             <Badge className={cn("border", getConfidenceBadgeClass(event.confidence))}>
               {formatConfidence(event.confidence)}
             </Badge>

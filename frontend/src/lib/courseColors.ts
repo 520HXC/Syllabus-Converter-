@@ -1,30 +1,15 @@
 import type { ResolvedTheme } from "../theme/theme"
 
-const darkCourseDisplayPalette = [
-  "#FBBF24",
-  "#4ADE80",
-  "#FB7185",
-  "#60A5FA",
-  "#C084FC",
-  "#22D3EE",
-] as const
-
 const defaultStoredCourseColor = "#0D9488"
 
-function hashCourseId(courseId: string) {
-  let hash = 2166136261
-  for (const character of courseId) {
-    hash ^= character.charCodeAt(0)
-    hash = Math.imul(hash, 16777619)
-  }
-  return hash >>> 0
+function isStoredCourseColor(value: string | null | undefined): value is string {
+  return Boolean(value && /^#[0-9A-Fa-f]{6}$/.test(value))
 }
 
 export function resolveCourseDisplayColor(
-  courseId: string,
+  _courseId: string,
   storedColor: string | null | undefined,
-  resolvedTheme: ResolvedTheme,
+  _resolvedTheme: ResolvedTheme,
 ) {
-  if (resolvedTheme === "light") return storedColor ?? defaultStoredCourseColor
-  return darkCourseDisplayPalette[hashCourseId(courseId) % darkCourseDisplayPalette.length]
+  return isStoredCourseColor(storedColor) ? storedColor : defaultStoredCourseColor
 }

@@ -2,26 +2,29 @@ import { useEffect, useRef, useState } from "react"
 import dayGridPlugin from "@fullcalendar/daygrid"
 import interactionPlugin from "@fullcalendar/interaction"
 import FullCalendar from "@fullcalendar/react"
-import { useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   CalendarDays,
+  Check,
   ChevronRight,
   Download,
   FileUp,
   Filter,
   List,
+  Palette,
   PanelLeftOpen,
 } from "lucide-react"
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom"
 
 import { AppShell } from "../components/AppShell"
+import { EventTypeBadge } from "../components/EventTypeBadge"
 import { ErrorState, LoadingState } from "../components/QueryState"
 import { Button } from "../components/ui/Button"
 import { Card } from "../components/ui/Card"
 import { useApi } from "../lib/api"
 import { resolveCourseDisplayColor } from "../lib/courseColors"
 import { useSemester } from "../lib/semester"
-import type { Course, ExtractedEvent } from "../lib/types"
+import type { Course, ExtractedEvent, ReviewPayload } from "../lib/types"
 import { cn } from "../lib/utils"
 import { useTheme } from "../theme/ThemeProvider"
 
@@ -32,6 +35,17 @@ const viewOptions: Array<{ label: string; value: CalendarView; icon: typeof Pane
   { label: "Month", value: "month", icon: CalendarDays },
   { label: "List", value: "list", icon: List },
 ]
+
+const courseColorChoices = [
+  { name: "Teal", value: "#0D9488" },
+  { name: "Blue", value: "#2563EB" },
+  { name: "Violet", value: "#7C3AED" },
+  { name: "Pink", value: "#DB2777" },
+  { name: "Orange", value: "#D97706" },
+  { name: "Green", value: "#059669" },
+  { name: "Red", value: "#DC2626" },
+  { name: "Cyan", value: "#0891B2" },
+] as const
 
 function isCalendarView(value: string | null): value is CalendarView {
   return value === "timeline" || value === "month" || value === "list"
@@ -152,11 +166,15 @@ function CalendarEmptyState({ message }: { message: string }) {
 export function CalendarPage() {
   const api = useApi()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const { semesterId } = useSemester()
   const { resolvedTheme } = useTheme()
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedCourseIds, setSelectedCourseIds] = useState<Set<string>>(new Set())
   const [initializedCourseFiltersForSemester, setInitializedCourseFiltersForSemester] = useState<string | null>(null)
+  const [expandedCourseColorId, setExpandedCourseColorId] = useState<string | null>(null)
+  const [pendingCourseColorId, setPendingCourseColorId] = useState<string | null>(null)
+  const [courseColorErrors, setCourseColorErrors] = useState<Record<string, string>>({})
   const [downloading, setDownloading] = useState(false)
   const [downloadError, setDownloadError] = useState<string | null>(null)
   const timelineScrollerRef = useRef<HTMLDivElement>(null)
@@ -170,6 +188,56 @@ export function CalendarPage() {
     queryKey: ["events", semesterId],
     queryFn: () => api.listEvents(semesterId!),
     enabled: Boolean(semesterId),
+  })
+  const courseColorMutation = useMutation({
+    mutationFn: ({ courseId, color }: { courseId: string; color: string }) =>
+      api.updateCourse(courseId, { color }),
+    onMutate: async ({ courseId, color }) => {
+      setCourseColorErrors((current) => {
+        const next = { ...current }
+        delete next[courseId]
+        return next
+      })
+      setPendingCourseColorId(courseId)
+      await queryClient.cancelQueries({ queryKey: ["review", semesterId] })
+      const previousReview = queryClient.getQueryData<ReviewPayload>(["review", semesterId])
+      queryClient.setQueryData<ReviewPayload>(["review", semesterId], (current) =>
+        current
+          ? {
+              ...current,
+              courses: current.courses.map((course) =>
+                course.id === courseId ? { ...course, color } : course,
+              ),
+            }
+          : current,
+      )
+      return { previousReview, courseId }
+    },
+    onError: (error, variables, context) => {
+      if (context?.previousReview) {
+        queryClient.setQueryData(["review", semesterId], context.previousReview)
+      }
+      setCourseColorErrors((current) => ({
+        ...current,
+        [variables.courseId]:
+          error instanceof Error ? error.message : "The course color could not be saved.",
+      }))
+    },
+    onSuccess: (updatedCourse) => {
+      queryClient.setQueryData<ReviewPayload>(["review", semesterId], (current) =>
+        current
+          ? {
+              ...current,
+              courses: current.courses.map((course) =>
+                course.id === updatedCourse.id ? updatedCourse : course,
+              ),
+            }
+          : current,
+      )
+    },
+    onSettled: (_data, _error, variables) => {
+      setPendingCourseColorId((current) => (current === variables.courseId ? null : current))
+    },
   })
 
   const requestedView = searchParams.get("view")
@@ -190,6 +258,30 @@ export function CalendarPage() {
     setSelectedCourseIds(new Set(reviewQuery.data.courses.map((course) => course.id)))
     setInitializedCourseFiltersForSemester(reviewQuery.data.semester.id)
   }, [initializedCourseFiltersForSemester, reviewQuery.data])
+
+  useEffect(() => {
+    if (!expandedCourseColorId) return
+
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target
+      if (!(target instanceof HTMLElement)) return
+      if (target.closest(`[data-course-filter-row-id="${expandedCourseColorId}"]`)) return
+      setExpandedCourseColorId(null)
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setExpandedCourseColorId(null)
+      }
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown)
+    document.addEventListener("keydown", handleKeyDown)
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown)
+      document.removeEventListener("keydown", handleKeyDown)
+    }
+  }, [expandedCourseColorId])
 
   if (!semesterId) return <Navigate replace to="/setup" />
   if (reviewQuery.isPending || eventsQuery.isPending) {
@@ -247,11 +339,17 @@ export function CalendarPage() {
     return [
       {
         id: event.id,
-        title: `${course?.code || course?.name || "Course"} ${event.title}`,
+        title: event.title,
         start: event.start_time ? `${event.event_date}T${event.start_time}` : event.event_date,
         allDay: event.is_all_day,
         backgroundColor: displayColor,
         borderColor: displayColor,
+        extendedProps: {
+          courseCode: course?.code || course?.name || "Course",
+          courseColor: displayColor,
+          eventTitle: event.title,
+          eventType: event.event_type,
+        },
       },
     ]
   })
@@ -269,6 +367,15 @@ export function CalendarPage() {
       else next.add(courseId)
       return next
     })
+  }
+
+  function toggleCourseColorPalette(courseId: string) {
+    setExpandedCourseColorId((current) => (current === courseId ? null : courseId))
+  }
+
+  function handleCourseColorSelect(courseId: string, color: string) {
+    setExpandedCourseColorId(null)
+    courseColorMutation.mutate({ courseId, color })
   }
 
   async function handleExport() {
@@ -305,6 +412,44 @@ export function CalendarPage() {
 
   function openReview(eventId: string) {
     navigate(`/review?eventId=${eventId}`)
+  }
+
+  function renderMonthEventContent({
+    event,
+  }: {
+    event: {
+      extendedProps: {
+        courseCode?: string
+        courseColor?: string
+        eventTitle?: string
+        eventType?: string
+      }
+    }
+  }) {
+    const { courseCode, courseColor, eventTitle, eventType } = event.extendedProps
+
+    return (
+      <div
+        aria-label={`${courseCode || "Course"} ${eventType || "unknown"} ${eventTitle || "event"}`}
+        className="flex min-w-0 items-start gap-1.5 overflow-hidden"
+      >
+        <span
+          aria-hidden="true"
+          className="mt-0.5 h-6 w-1 shrink-0 rounded-full"
+          style={{ backgroundColor: courseColor }}
+        />
+        <div className="min-w-0">
+          <p className="truncate text-[0.62rem] font-semibold uppercase tracking-[0.12em] text-text/80">
+            {courseCode}
+          </p>
+          <EventTypeBadge
+            className="mt-0.5 max-w-full truncate px-1.5 py-0 text-[0.6rem] font-semibold normal-case"
+            eventType={eventType || "unknown"}
+          />
+          <p className="mt-0.5 truncate text-[0.72rem] font-semibold text-text">{eventTitle}</p>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -397,25 +542,95 @@ export function CalendarPage() {
                   These same filters drive timeline, month, list, and ICS export.
                 </p>
                 <div className="mt-4 grid gap-2">
-                  {courses.map((course) => (
-                    <label
-                      className="flex min-h-11 cursor-pointer items-center gap-3 rounded-2xl border border-transparent px-3 py-2 text-sm font-medium text-text-muted transition-colors hover:border-border hover:bg-panel"
-                      key={course.id}
-                    >
-                      <input
-                        aria-label={course.code || course.name}
-                        checked={selectedCourseIds.has(course.id)}
-                        className="size-4 accent-accent"
-                        onChange={() => toggleCourse(course.id)}
-                        type="checkbox"
-                      />
-                      <span
-                        className="size-2.5 shrink-0 rounded-full"
-                        style={{ backgroundColor: courseDisplayColors.get(course.id) ?? course.color }}
-                      />
-                      <span className="truncate">{course.code || course.name}</span>
-                    </label>
-                  ))}
+                  {courses.map((course) => {
+                    const courseLabel = course.code || course.name
+                    const courseColor = courseDisplayColors.get(course.id) ?? course.color
+                    const courseColorError = courseColorErrors[course.id]
+                    const isPickerOpen = expandedCourseColorId === course.id
+                    const isSavingColor = pendingCourseColorId === course.id
+
+                    return (
+                      <div
+                        className="rounded-2xl border border-transparent px-2 py-1 transition-colors hover:border-border hover:bg-panel"
+                        data-course-filter-row-id={course.id}
+                        data-testid={`course-filter-row-${course.id}`}
+                        key={course.id}
+                      >
+                        <div className="flex items-center gap-2">
+                          <label className="flex min-h-11 min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-2xl px-1 py-1 text-sm font-medium text-text-muted">
+                            <input
+                              aria-label={courseLabel}
+                              checked={selectedCourseIds.has(course.id)}
+                              className="size-4 accent-accent"
+                              onChange={() => toggleCourse(course.id)}
+                              type="checkbox"
+                            />
+                            <span
+                              className="size-2.5 shrink-0 rounded-full"
+                              data-testid={`course-filter-swatch-${course.id}`}
+                              style={{ backgroundColor: courseColor }}
+                            />
+                            <span className="truncate">{courseLabel}</span>
+                          </label>
+                          <div className="relative shrink-0">
+                            <button
+                              aria-controls={isPickerOpen ? `course-color-picker-${course.id}` : undefined}
+                              aria-expanded={isPickerOpen}
+                              aria-haspopup="dialog"
+                              aria-label={`Change color for ${courseLabel}`}
+                              className={cn(
+                                "inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 bg-panel px-3 text-text transition-colors hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
+                                isPickerOpen && "border-accent text-accent",
+                              )}
+                              data-testid={`course-color-trigger-${course.id}`}
+                              onClick={() => toggleCourseColorPalette(course.id)}
+                              type="button"
+                            >
+                              <Palette aria-hidden="true" className="size-4" />
+                            </button>
+                            {isPickerOpen ? (
+                              <div
+                                aria-label={`Choose a color for ${courseLabel}`}
+                                className="absolute right-0 z-20 mt-2 w-60 rounded-2xl border border-border/80 bg-panel p-3 shadow-panel"
+                                id={`course-color-picker-${course.id}`}
+                                role="group"
+                              >
+                                <div className="grid grid-cols-4 gap-2">
+                                  {courseColorChoices.map((choice) => {
+                                    const isActive = courseColor.toLowerCase() === choice.value.toLowerCase()
+                                    return (
+                                      <button
+                                        aria-label={choice.name}
+                                        className={cn(
+                                          "relative inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
+                                          isActive && "ring-2 ring-focus ring-offset-2 ring-offset-panel",
+                                        )}
+                                        key={choice.value}
+                                        onClick={() => handleCourseColorSelect(course.id, choice.value)}
+                                        style={{ backgroundColor: choice.value }}
+                                        type="button"
+                                      >
+                                        <span className="sr-only">{choice.name}</span>
+                                        {isActive ? <Check aria-hidden="true" className="size-4" /> : null}
+                                      </button>
+                                    )
+                                  })}
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                        {courseColorError ? (
+                          <p className="mt-2 text-sm font-medium text-danger" role="alert">
+                            {courseColorError}
+                          </p>
+                        ) : null}
+                        {isSavingColor ? (
+                          <p className="mt-2 text-xs font-medium text-text-subtle">Saving color...</p>
+                        ) : null}
+                      </div>
+                    )
+                  })}
                 </div>
               </Card>
             </aside>
@@ -446,12 +661,19 @@ export function CalendarPage() {
                             <span
                               aria-hidden="true"
                               className="h-10 w-1.5 rounded-full"
+                              data-testid={`calendar-course-rail-this-week-${event.id}`}
                               style={{ backgroundColor: courseDisplayColor }}
                             />
                             <div className="min-w-0">
-                              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-text-subtle">
-                                {course?.code || course?.name || "Course"}
-                              </p>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-text-subtle">
+                                  {course?.code || course?.name || "Course"}
+                                </p>
+                                <EventTypeBadge
+                                  className="px-2 py-0.5 text-[0.68rem] font-semibold normal-case"
+                                  eventType={event.event_type}
+                                />
+                              </div>
                               <p className="mt-1 font-semibold text-text">{event.title}</p>
                               <p className="mt-1 text-sm text-text-muted">
                                 {formatDate(event.event_date!)}
@@ -562,6 +784,7 @@ export function CalendarPage() {
                         info.jsEvent.preventDefault()
                         navigate(`/review?eventId=${info.event.id}`)
                       }}
+                      eventContent={renderMonthEventContent}
                       events={monthEvents}
                       firstDay={1}
                       fixedWeekCount={false}
@@ -602,12 +825,18 @@ export function CalendarPage() {
                                     <span
                                       aria-hidden="true"
                                       className="mt-0.5 h-10 w-1.5 shrink-0 rounded-full"
+                                      data-testid={`calendar-course-rail-list-${event.id}`}
                                       style={{ backgroundColor: courseDisplayColor }}
                                     />
                                     <div className="min-w-0">
-                                      <div className="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-[0.12em] text-text-subtle">
-                                        <span>{course?.code || course?.name || "Course"}</span>
-                                        <span>{event.event_type}</span>
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="text-xs font-semibold uppercase tracking-[0.12em] text-text-subtle">
+                                          {course?.code || course?.name || "Course"}
+                                        </span>
+                                        <EventTypeBadge
+                                          className="px-2 py-0.5 text-[0.68rem] font-semibold normal-case"
+                                          eventType={event.event_type}
+                                        />
                                       </div>
                                       <p className="mt-2 text-base font-semibold text-text">{event.title}</p>
                                       <p className="mt-1 text-sm text-text-muted">
@@ -652,7 +881,11 @@ function FragmentRow({
   return (
     <>
       <div className="sticky left-0 z-20 flex items-center gap-3 border-b border-r border-border bg-panel px-4 py-4">
-        <span className="size-3 rounded-full" style={{ backgroundColor: courseColor }} />
+        <span
+          className="size-3 rounded-full"
+          data-testid={`calendar-course-dot-timeline-${course.id}`}
+          style={{ backgroundColor: courseColor }}
+        />
         <div className="min-w-0">
           <p className="truncate font-semibold text-text">{course.code || course.name}</p>
           <p className="truncate text-xs text-text-subtle">{course.name}</p>
@@ -677,6 +910,10 @@ function FragmentRow({
                   }}
                   to={`/review?eventId=${event.id}`}
                 >
+                  <EventTypeBadge
+                    className="px-2 py-0.5 text-[0.68rem] font-semibold normal-case"
+                    eventType={event.event_type}
+                  />
                   <p className="line-clamp-2">{event.title}</p>
                   <p className="mt-1 text-xs text-text-muted">{formatDate(event.event_date!)}</p>
                 </Link>

@@ -164,16 +164,16 @@ test("maps review course colors onto the dark display palette for active, review
   renderReviewPage()
 
   expect(await screen.findByText("Previewing cs101.pdf")).toBeInTheDocument()
-  expect(screen.getByTestId("course-rail-event-1")).toHaveStyle({ backgroundColor: "#C084FC" })
+  expect(screen.getByTestId("course-rail-event-1")).toHaveStyle({ backgroundColor: "#0D9488" })
 
   const courseSection = screen.getByRole("heading", { name: "CS 101" }).closest("section")
-  expect(courseSection?.querySelector("span[style]")).toHaveStyle({ backgroundColor: "#C084FC" })
+  expect(courseSection?.querySelector("span[style]")).toHaveStyle({ backgroundColor: "#0D9488" })
 
   await user.click(screen.getByRole("button", { name: /Reviewed events/i }))
-  expect(screen.getByTestId("course-rail-event-2")).toHaveStyle({ backgroundColor: "#22D3EE" })
+  expect(screen.getByTestId("course-rail-event-2")).toHaveStyle({ backgroundColor: "#2563EB" })
 
   await user.click(screen.getByRole("button", { name: /Removed events/i }))
   expect(screen.getByText("Old reminder").parentElement?.previousElementSibling).toHaveStyle({
-    backgroundColor: "#C084FC",
+    backgroundColor: "#0D9488",
   })
 })

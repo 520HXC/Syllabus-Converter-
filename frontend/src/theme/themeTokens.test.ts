@@ -3,7 +3,7 @@ import { resolve } from "node:path"
 
 import { expect, test } from "vitest"
 
-const indexCss = readFileSync(resolve(import.meta.dirname, "../index.css"), "utf8")
+const indexCss = readFileSync(resolve(import.meta.dirname, "../index.css"), "utf8").replace(/\r\n/g, "\n")
 
 test("uses the approved high-contrast dark theme tokens without teal gradients", () => {
   expect(indexCss).toContain("--bg-app: 10 10 10;")
@@ -26,10 +26,16 @@ test("uses the approved high-contrast dark theme tokens without teal gradients",
 
 test("defines semantic review badge colors for both themes", () => {
   expect(indexCss).toContain("--event-exam: 190 24 93;")
+  expect(indexCss).toContain("--event-class: 21 128 61;")
+  expect(indexCss).toContain("--event-deadline: 180 83 9;")
   expect(indexCss).toContain("--confidence-medium: 180 83 9;")
   expect(indexCss).toContain("--confidence-high: 21 128 61;")
   expect(indexCss).toContain("--confidence-low: 185 28 28;")
   expect(indexCss).toContain("--event-exam: 253 164 175;")
+  expect(indexCss).toContain("--event-class: 134 239 172;")
+  expect(indexCss).toContain("--event-deadline: 251 191 36;")
+  expect(indexCss).toContain("--event-reading: 94 234 212;")
+  expect(indexCss).toContain("--event-other: 100 116 139;")
   expect(indexCss).toContain("--confidence-medium: 251 191 36;")
   expect(indexCss).toContain("--confidence-high: 134 239 172;")
   expect(indexCss).toContain("--confidence-low: 253 164 175;")

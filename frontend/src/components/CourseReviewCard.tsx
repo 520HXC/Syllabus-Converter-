@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react"
 import { BookOpen, Save } from "lucide-react"
 
-import type { Course } from "../lib/types"
+import type { Course, CourseUpdatePayload } from "../lib/types"
 import { Button } from "./ui/Button"
 import { Card } from "./ui/Card"
 import { Input } from "./ui/Input"
@@ -13,7 +13,7 @@ export function CourseReviewCard({
 }: {
   course: Course
   courseDisplayColor?: string
-  onSave: (courseId: string, values: Pick<Course, "code" | "name" | "instructor">) => Promise<void>
+  onSave: (courseId: string, values: CourseUpdatePayload) => Promise<void>
 }) {
   const [code, setCode] = useState(course.code ?? "")
   const [name, setName] = useState(course.name)
