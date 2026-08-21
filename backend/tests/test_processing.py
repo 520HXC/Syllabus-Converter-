@@ -2404,6 +2404,167 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
     assert calls == ["gpt-5.6-luna"]
 
 
+def test_process_job_filters_non_actionable_course_structure_lab_entry(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2026",
+            start_date=date(2026, 8, 24),
+            end_date=date(2026, 12, 18),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="course-structure.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/course-structure.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf(
+            "Course Structure: This course includes twice-weekly lecture sections and one "
+            "mandatory weekly lab section. LB1 - LB8 See Albert See Albert. " * 4
+        )
+    )
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Mandatory weekly lab",
+                event_type="class",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote=(
+                    "Course Structure: This course includes twice-weekly lecture sections and "
+                    "one mandatory weekly lab section. LB1 - LB8 See Albert See Albert"
+                ),
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+                extraction_model="gpt-5.6-terra",
+            )
+        ],
+        recurring_rules=[],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            return SimpleNamespace(output_parsed=luna_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.document.semester.events == []
+        series_count = session.query(RecurringEventSeries).filter(
+            RecurringEventSeries.document_id == persisted.document.id
+        ).count()
+        assert series_count == 0
+
+
+def test_expand_recurring_rules_keeps_exact_class_rule_with_range_and_time():
+    exact_class_rule = RecurringRule(
+        title="Lecture",
+        event_type="class",
+        rule_kind="weekly_fixed",
+        weekday="monday",
+        start_time=time(10, 0),
+        end_time=time(11, 15),
+        is_all_day=False,
+        boundary_start=date(2026, 9, 7),
+        boundary_end=date(2026, 9, 21),
+        exclusion_dates=[],
+        source_quote="Lecture meets every Monday at 10:00 from Sep 7, 2026 through Sep 21, 2026",
+        source_page=1,
+        confidence="high",
+        anchor_title=None,
+        offset_days=None,
+        uncertainty_reason=None,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[exact_class_rule],
+    )
+    pages = [
+        {
+            "page": 1,
+            "ocr": False,
+            "text": (
+                "Course Structure: This course includes twice-weekly lecture sections and one "
+                "mandatory weekly lab section. "
+                "Lecture meets every Monday at 10:00 from Sep 7, 2026 through Sep 21, 2026."
+            ),
+        }
+    ]
+
+    normalized, _, _ = processing._normalize_ambiguous_recurring_content(extraction, pages)
+    series, derived_events = expand_recurring_rules(
+        anchors=[],
+        rules=normalized.recurring_rules,
+        semester_start=date(2026, 9, 1),
+        semester_end=date(2026, 9, 30),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert normalized.recurring_rules[0].expansion_mode == "exact"
+    assert len(series) == 1
+    assert [(event.event_date, event.start_time, event.end_time) for event in derived_events] == [
+        (date(2026, 9, 7), time(10, 0), time(11, 15)),
+        (date(2026, 9, 14), time(10, 0), time(11, 15)),
+        (date(2026, 9, 21), time(10, 0), time(11, 15)),
+    ]
+
+
 def test_expand_recurring_rules_honors_boundaries_exclusions_dedupes_and_caps():
     anchor = ScheduleAnchor(
         title="Lecture",

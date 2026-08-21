@@ -65,6 +65,10 @@ DETERMINISTIC_RECURRING_RULE_PATTERN = re.compile(
     r"(?P<cue>every\b|each\s+week\b|weekly\b)",
     re.IGNORECASE,
 )
+COURSE_STRUCTURE_PATTERN = re.compile(
+    r"\b(?:course structure|this course includes|lecture sections?|lab section)\b",
+    re.IGNORECASE,
+)
 
 
 def resolve_recurring_series_id(
@@ -336,6 +340,14 @@ def extract_with_openai(
 MONTH_PATTERN = (
     r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+)
+ACTIONABLE_SCHEDULE_PATTERN = re.compile(
+    rf"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b|"
+    rf"\bfrom\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b|"
+    rf"\bthrough\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b|"
+    r"\bat\s+\d{1,2}(?::\d{2})?\b|"
+    r"\bmeets every\b",
+    re.IGNORECASE,
 )
 EVENT_PATTERN = re.compile(
     rf"(?P<title>[^\n.]{{0,100}}?(?:midterm|final|exam|quiz|assignment|project|paper|"
@@ -688,6 +700,59 @@ def _event_requires_review_only(event: CandidateEvent, pages: list[dict]) -> boo
             _is_ambiguous_recurrence_text(segment) for segment in related_segments
             )
         )
+    )
+
+
+def _is_non_actionable_course_structure_text(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", value).strip()
+    return bool(
+        normalized
+        and COURSE_STRUCTURE_PATTERN.search(normalized)
+        and not ACTIONABLE_SCHEDULE_PATTERN.search(normalized)
+    )
+
+
+def _is_non_actionable_course_structure_event(event: CandidateEvent) -> bool:
+    return bool(
+        event.event_type == "class"
+        and event.event_date is None
+        and event.start_time is None
+        and event.end_time is None
+        and _is_non_actionable_course_structure_text(event.source_quote)
+    )
+
+
+def _is_non_actionable_course_structure_rule(rule: RecurringRule) -> bool:
+    return bool(
+        rule.event_type == "class"
+        and rule.start_time is None
+        and rule.end_time is None
+        and rule.weekday is None
+        and rule.boundary_start is None
+        and rule.boundary_end is None
+        and rule.offset_days is None
+        and _is_non_actionable_course_structure_text(rule.source_quote)
+    )
+
+
+def _filter_non_actionable_course_structure_items(
+    extraction: SyllabusExtraction,
+) -> SyllabusExtraction:
+    return SyllabusExtraction(
+        course_code=extraction.course_code,
+        course_name=extraction.course_name,
+        instructor=extraction.instructor,
+        events=[
+            event.model_copy(deep=True)
+            for event in extraction.events
+            if not _is_non_actionable_course_structure_event(event)
+        ],
+        schedule_anchors=[anchor.model_copy(deep=True) for anchor in extraction.schedule_anchors],
+        recurring_rules=[
+            rule.model_copy(deep=True)
+            for rule in extraction.recurring_rules
+            if not _is_non_actionable_course_structure_rule(rule)
+        ],
     )
 
 
@@ -1402,6 +1467,7 @@ def process_job(
                 job.primary_model = None
                 job.fallback_model = None
 
+            extraction = _filter_non_actionable_course_structure_items(extraction)
             extraction, ambiguous_event_indexes, ambiguous_warning_reason = (
                 _normalize_ambiguous_recurring_content(extraction, pages)
             )
