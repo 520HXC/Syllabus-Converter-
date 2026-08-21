@@ -46,13 +46,23 @@ RETRYABLE_TERRA_CODE_ORDER = {
     "TERRA_RETRY_FAILED": 5,
 }
 AMBIGUOUS_RECURRENCE_PATTERN = re.compile(
-    r"\b(?:nearly every|usually|periodically|may)\b",
+    r"\b(?:nearly every|usually|periodically)\b",
+    re.IGNORECASE,
+)
+AMBIGUOUS_MODAL_MAY_PATTERN = re.compile(
+    r"\bmay\s+(?:occur|be scheduled|start|include|change)\b",
+    re.IGNORECASE,
+)
+RELATIVE_REVIEW_ONLY_PATTERN = re.compile(
+    r"\b(?:the\s+)?morning\s+(?:of|after)\s+(?:the\s+)?lecture\b|"
+    r"\bsunday\s+(?:that\s+)?follow(?:s|ing)\s+(?:the\s+)?lab\b",
     re.IGNORECASE,
 )
 DETERMINISTIC_RECURRING_RULE_PATTERN = re.compile(
     r"(?P<title>[A-Za-z0-9 &/\-]{1,120}?)\s+"
+    r"(?:(?:is|are)\s+)?"
     r"(?P<action>due|scheduled)\s+"
-    r"(?P<cue>every|each|weekly)\b",
+    r"(?P<cue>every\b|each\s+week\b|weekly\b)",
     re.IGNORECASE,
 )
 
@@ -306,8 +316,14 @@ def extract_with_openai(
             "Do not include routine class meetings, lecture topics, office hours, or readings. "
             "Keep important items whose date is not published yet and set event_date to null. "
             "Extract schedule_anchors for recurring lectures, labs, or discussions. "
+            "When the syllabus lists irregular explicit meeting rows or dates for an anchor, "
+            "populate ScheduleOccurrence entries on that anchor with occurrence_date, title, "
+            "anchor_type, source_quote, and source_page. "
             "Extract recurring_rules for weekly fixed rules and rules that are relative to "
-            "a lecture or lab anchor. Use the page markers for source_page. Copy a short exact "
+            "a lecture or lab anchor. Set expansion_mode review_only when recurrence wording "
+            "is ambiguous or when a relative phrase like morning of the lecture, morning after "
+            "the lecture, or Sunday following the lab does not identify every occurrence. "
+            "Otherwise use expansion_mode exact. Use the page markers for source_page. Copy a short exact "
             "source_quote. Do not invent dates. "
             "Mark whether the source explicitly states the year. "
             "Use low confidence and explain uncertainty whenever wording is tentative "
@@ -547,8 +563,25 @@ def _build_rule_payload(rule: RecurringRule) -> dict:
     }
 
 
+def _stable_title_key(value: str) -> str:
+    tokens = re.sub(r"\s+", " ", value).strip(" :-").split()
+    while tokens and tokens[-1].casefold() in {"is", "are", "due", "scheduled"}:
+        tokens.pop()
+    return " ".join(tokens).casefold()
+
+
+def _display_title(value: str) -> str:
+    tokens = re.sub(r"\s+", " ", value).strip(" :-").split()
+    while tokens and tokens[-1].casefold() in {"is", "are", "due", "scheduled"}:
+        tokens.pop()
+    return " ".join(tokens).strip() or value.strip()
+
+
 def _is_ambiguous_recurrence_text(value: str) -> bool:
-    return bool(AMBIGUOUS_RECURRENCE_PATTERN.search(value))
+    return bool(
+        AMBIGUOUS_RECURRENCE_PATTERN.search(value)
+        or AMBIGUOUS_MODAL_MAY_PATTERN.search(value)
+    )
 
 
 def _cap_confidence_for_ambiguous_recurrence(confidence: ConfidenceLevel) -> ConfidenceLevel:
@@ -557,8 +590,45 @@ def _cap_confidence_for_ambiguous_recurrence(confidence: ConfidenceLevel) -> Con
     return confidence
 
 
+def _page_text(source_page: int, pages: list[dict]) -> str:
+    return next((page["text"] for page in pages if page["page"] == source_page), "")
+
+
+def _rule_requires_review_only(rule: RecurringRule, pages: list[dict]) -> bool:
+    page_text = _page_text(rule.source_page, pages)
+    has_relative_phrase = bool(
+        RELATIVE_REVIEW_ONLY_PATTERN.search(rule.source_quote)
+        or RELATIVE_REVIEW_ONLY_PATTERN.search(page_text)
+    )
+    if rule.expansion_mode == "review_only":
+        return True
+    if _is_ambiguous_recurrence_text(rule.source_quote):
+        return True
+    if rule.rule_kind == "relative_to_anchor" and has_relative_phrase:
+        return True
+    if has_relative_phrase and _is_ambiguous_recurrence_text(page_text):
+        return True
+    if _is_ambiguous_recurrence_text(page_text) and rule.rule_kind == "weekly_fixed":
+        return True
+    return False
+
+
+def _event_requires_review_only(event: CandidateEvent, pages: list[dict]) -> bool:
+    page_text = _page_text(event.source_page, pages)
+    has_relative_phrase = bool(
+        RELATIVE_REVIEW_ONLY_PATTERN.search(event.source_quote)
+        or RELATIVE_REVIEW_ONLY_PATTERN.search(page_text)
+    )
+    return bool(
+        _is_ambiguous_recurrence_text(event.source_quote)
+        or has_relative_phrase
+        or (has_relative_phrase and _is_ambiguous_recurrence_text(page_text))
+    )
+
+
 def _normalize_ambiguous_recurring_content(
     extraction: SyllabusExtraction,
+    pages: list[dict],
 ) -> tuple[SyllabusExtraction, set[int], str]:
     events = [event.model_copy(deep=True) for event in extraction.events]
     rules = [rule.model_copy(deep=True) for rule in extraction.recurring_rules]
@@ -573,6 +643,7 @@ def _normalize_ambiguous_recurring_content(
     def normalize_event(event: CandidateEvent) -> CandidateEvent:
         return event.model_copy(
             update={
+                "title": _display_title(event.title),
                 "event_date": None,
                 "recurring_series_id": None,
                 "confidence": _cap_confidence_for_ambiguous_recurrence(event.confidence),
@@ -582,27 +653,28 @@ def _normalize_ambiguous_recurring_content(
         )
 
     for rule_index, rule in enumerate(rules):
-        if not _is_ambiguous_recurrence_text(rule.source_quote):
+        if not _rule_requires_review_only(rule, pages):
             continue
+        stable_rule_title = _stable_title_key(rule.title)
         rules[rule_index] = rule.model_copy(
             update={
+                "title": _display_title(rule.title),
                 "expansion_mode": "review_only",
                 "confidence": _cap_confidence_for_ambiguous_recurrence(rule.confidence),
             }
         )
-        normalized_title = _normalize_title(rule.title)
         event_index = next(
             (
                 index
                 for index, event in enumerate(events)
-                if _normalize_title(event.title) == normalized_title
+                if _stable_title_key(event.title) == stable_rule_title
             ),
             None,
         )
         if event_index is None:
             events.append(
                 CandidateEvent(
-                    title=rule.title,
+                    title=_display_title(rule.title),
                     event_type=rule.event_type,
                     event_date=None,
                     start_time=rule.start_time,
@@ -624,7 +696,7 @@ def _normalize_ambiguous_recurring_content(
             normalized_event_indexes.add(event_index)
 
     for index, event in enumerate(events):
-        if event.event_date is None and _is_ambiguous_recurrence_text(event.source_quote):
+        if event.event_date is None and _event_requires_review_only(event, pages):
             events[index] = normalize_event(event)
             normalized_event_indexes.add(index)
 
@@ -646,26 +718,55 @@ def _detect_missing_recurring_rule(
     extraction: SyllabusExtraction | SyllabusRepair,
     pages: list[dict],
 ) -> list[str]:
-    existing_rule_titles = {_normalize_title(rule.title) for rule in extraction.recurring_rules}
-    existing_event_titles = {_normalize_title(event.title) for event in extraction.events}
-    missing_titles: list[str] = []
+    return [item["stable_title"] for item in _find_missing_recurring_rule_candidates(extraction, pages)]
+
+
+def _find_missing_recurring_rule_candidates(
+    extraction: SyllabusExtraction | SyllabusRepair,
+    pages: list[dict],
+) -> list[dict]:
+    existing_rule_titles = {_stable_title_key(rule.title) for rule in extraction.recurring_rules}
+    existing_event_titles = {
+        _stable_title_key(event.title)
+        for event in extraction.events
+        if event.event_date is not None
+    }
+    missing_candidates: list[dict] = []
+    seen_titles: set[str] = set()
 
     for page in pages:
         for raw_segment in re.split(r"[\n.]+", page["text"]):
             segment = raw_segment.strip()
-            if not segment or _is_ambiguous_recurrence_text(segment):
+            if (
+                not segment
+                or _is_ambiguous_recurrence_text(segment)
+                or RELATIVE_REVIEW_ONLY_PATTERN.search(segment)
+            ):
                 continue
             match = DETERMINISTIC_RECURRING_RULE_PATTERN.search(segment)
             if match is None:
                 continue
-            title = _normalize_title(match.group("title").strip(" :-"))
-            if not title:
+            title = _display_title(match.group("title"))
+            stable_title = _stable_title_key(title)
+            if not stable_title:
                 continue
-            if title in existing_rule_titles or title in existing_event_titles:
+            if (
+                stable_title in existing_rule_titles
+                or stable_title in existing_event_titles
+                or stable_title in seen_titles
+            ):
                 continue
-            missing_titles.append(title)
+            missing_candidates.append(
+                {
+                    "title": title,
+                    "stable_title": stable_title,
+                    "source_quote": re.sub(r"\s+", " ", segment).strip(),
+                    "source_page": page["page"],
+                }
+            )
+            seen_titles.add(stable_title)
 
-    return _ordered_unique(missing_titles)
+    return missing_candidates
 
 
 def expand_recurring_rules(
@@ -957,9 +1058,18 @@ def _merge_extractions(
             for index in sorted(flagged_rule_indexes)
         )
 
-    merged_anchors = repair.schedule_anchors or [
-        anchor.model_copy(deep=True) for anchor in primary.schedule_anchors
-    ]
+    merged_anchors = [anchor.model_copy(deep=True) for anchor in primary.schedule_anchors]
+    anchor_indexes = {
+        (_stable_title_key(anchor.title), anchor.anchor_type): index
+        for index, anchor in enumerate(merged_anchors)
+    }
+    for anchor in repair.schedule_anchors:
+        key = (_stable_title_key(anchor.title), anchor.anchor_type)
+        if key in anchor_indexes:
+            merged_anchors[anchor_indexes[key]] = anchor
+        else:
+            anchor_indexes[key] = len(merged_anchors)
+            merged_anchors.append(anchor)
     return SyllabusExtraction(
         course_code=repair.course_code or primary.course_code,
         course_name=repair.course_name or primary.course_name,
@@ -1016,7 +1126,64 @@ def _extract_with_model_fallback(
         )
         _apply_extraction_model(repair, settings.openai_fallback_model)
         merged = _merge_extractions(primary, repair, flagged_event_indexes, flagged_rule_indexes)
-        return merged, True, retryable_codes, set()
+        unresolved_missing_candidates = _find_missing_recurring_rule_candidates(merged, pages)
+        if not unresolved_missing_candidates:
+            return merged, True, retryable_codes, set()
+        merged_events = [event.model_copy(deep=True) for event in merged.events]
+        failed_repair_keys: set[tuple[str, date | None]] = set()
+        for candidate in unresolved_missing_candidates:
+            event_index = next(
+                (
+                    index
+                    for index, event in enumerate(merged_events)
+                    if _stable_title_key(event.title) == candidate["stable_title"]
+                    and event.event_date is None
+                ),
+                None,
+            )
+            if event_index is None:
+                merged_events.append(
+                    CandidateEvent(
+                        title=candidate["title"],
+                        event_type="assignment",
+                        event_date=None,
+                        start_time=None,
+                        end_time=None,
+                        is_all_day=True,
+                        source_quote=candidate["source_quote"],
+                        source_page=candidate["source_page"],
+                        confidence="medium",
+                        year_was_explicit=True,
+                        uncertainty_reason=None,
+                        extraction_model=settings.openai_fallback_model,
+                        derivation_summary=(
+                            "Dates were not generated because the syllabus does not identify every occurrence."
+                        ),
+                        review_status=ReviewStatus.NEEDS_REVIEW,
+                    )
+                )
+                event_index = len(merged_events) - 1
+            else:
+                merged_events[event_index] = merged_events[event_index].model_copy(
+                    update={
+                        "title": candidate["title"],
+                        "event_date": None,
+                        "source_quote": candidate["source_quote"],
+                        "source_page": candidate["source_page"],
+                        "extraction_model": settings.openai_fallback_model,
+                        "derivation_summary": (
+                            "Dates were not generated because the syllabus does not identify every occurrence."
+                        ),
+                        "review_status": ReviewStatus.NEEDS_REVIEW,
+                    }
+                )
+            failed_repair_keys.add((_normalize_title(merged_events[event_index].title), None))
+        return (
+            merged.model_copy(update={"events": merged_events}),
+            True,
+            _ordered_retryable_codes([*retryable_codes, "TERRA_RETRY_FAILED"]),
+            failed_repair_keys,
+        )
     except StructuredExtractionError:
         return (
             primary,
@@ -1164,7 +1331,7 @@ def process_job(
                 job.fallback_model = None
 
             extraction, ambiguous_event_indexes, ambiguous_warning_reason = (
-                _normalize_ambiguous_recurring_content(extraction)
+                _normalize_ambiguous_recurring_content(extraction, pages)
             )
             job.fallback_used = fallback_used
             job.fallback_reason_codes = fallback_reason_codes
@@ -1298,6 +1465,15 @@ def process_job(
                         ]
                         if part
                     )
+                candidate_fallback_reason_codes = (
+                    ["TERRA_RETRY_FAILED"]
+                    if failed_key in failed_repair_keys
+                    else fallback_reason_codes
+                    if candidate.extraction_model == settings.openai_fallback_model
+                    else ["TERRA_RETRY_FAILED"]
+                    if "TERRA_RETRY_FAILED" in warning_codes
+                    else []
+                )
                 if candidate.recurring_series_id is not None:
                     series_payload = series_map.get(candidate.recurring_series_id)
                     if series_payload is not None:
@@ -1327,11 +1503,7 @@ def process_job(
                         warning_codes=_ordered_unique(warning_codes),
                         warning_reason=warning_reason,
                         extraction_model=candidate.extraction_model,
-                        fallback_reason_codes=fallback_reason_codes
-                        if candidate.extraction_model == settings.openai_fallback_model
-                        else ["TERRA_RETRY_FAILED"]
-                        if "TERRA_RETRY_FAILED" in warning_codes
-                        else [],
+                        fallback_reason_codes=candidate_fallback_reason_codes,
                         derivation_summary=candidate.derivation_summary,
                         review_status=ReviewStatus.NEEDS_REVIEW,
                     )
