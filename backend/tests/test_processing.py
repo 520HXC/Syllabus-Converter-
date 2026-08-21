@@ -913,6 +913,598 @@ def test_process_job_fails_when_both_models_cannot_parse_structured_output(app_c
         assert "structured syllabus extraction" in persisted.error_message
 
 
+def test_expand_recurring_rules_uses_explicit_irregular_anchor_occurrences_for_exact_rules():
+    anchor = ScheduleAnchor(
+        title="Lecture",
+        anchor_type="lecture",
+        weekday="tuesday",
+        start_time=time(9, 0),
+        end_time=time(10, 0),
+        boundary_start=date(2025, 9, 1),
+        boundary_end=date(2025, 9, 10),
+        exclusion_dates=[],
+        source_quote="Lecture dates are September 2 and September 5.",
+        source_page=1,
+        occurrences=[
+            {
+                "occurrence_date": date(2025, 9, 2),
+                "title": "Lecture 1",
+                "anchor_type": "lecture",
+                "source_quote": "Lecture on September 2",
+                "source_page": 1,
+            },
+            {
+                "occurrence_date": date(2025, 9, 5),
+                "title": "Lecture 2",
+                "anchor_type": "lecture",
+                "source_quote": "Lecture on September 5",
+                "source_page": 1,
+            },
+            {
+                "occurrence_date": date(2025, 9, 7),
+                "title": "Lab make-up",
+                "anchor_type": "lab",
+                "source_quote": "Lab make-up on September 7",
+                "source_page": 1,
+            },
+        ],
+    )
+    rule = RecurringRule(
+        title="Exercise Set",
+        event_type="assignment",
+        rule_kind="relative_to_anchor",
+        weekday=None,
+        start_time=time(8, 0),
+        end_time=None,
+        is_all_day=False,
+        boundary_start=date(2025, 9, 1),
+        boundary_end=date(2025, 9, 10),
+        exclusion_dates=[],
+        source_quote="Exercise Sets at 8AM the morning after lecture.",
+        source_page=1,
+        confidence="high",
+        anchor_title="Lecture",
+        offset_days=1,
+        uncertainty_reason=None,
+        expansion_mode="exact",
+    )
+
+    series, derived_events = expand_recurring_rules(
+        anchors=[anchor],
+        rules=[rule],
+        semester_start=date(2025, 9, 1),
+        semester_end=date(2025, 9, 30),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert len(series) == 1
+    assert [event.event_date for event in derived_events] == [
+        date(2025, 9, 3),
+        date(2025, 9, 6),
+    ]
+    assert derived_events[0].start_time == time(8, 0)
+    assert series[0].occurrence_count == 2
+
+
+def test_expand_recurring_rules_skips_review_only_rules():
+    review_only_rule = RecurringRule(
+        title="Quick Checks",
+        event_type="quiz",
+        rule_kind="weekly_fixed",
+        weekday="friday",
+        start_time=time(8, 0),
+        end_time=None,
+        is_all_day=False,
+        boundary_start=date(2025, 9, 1),
+        boundary_end=date(2025, 9, 30),
+        exclusion_dates=[],
+        source_quote="Quick Checks at 8AM with nearly every topic.",
+        source_page=1,
+        confidence="medium",
+        anchor_title=None,
+        offset_days=None,
+        uncertainty_reason=None,
+        expansion_mode="review_only",
+    )
+
+    series, derived_events = expand_recurring_rules(
+        anchors=[],
+        rules=[review_only_rule],
+        semester_start=date(2025, 9, 1),
+        semester_end=date(2025, 9, 30),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert series == []
+    assert derived_events == []
+
+
+def test_process_job_normalizes_ambiguous_recurring_candidate_without_duplication(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    calls: list[str] = []
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 19),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="fall2025.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/fall2025.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf("Quick Checks at 8AM the morning of lecture with nearly every topic. " * 4)
+    )
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Quick Checks",
+                event_type="quiz",
+                event_date=None,
+                start_time=time(8, 0),
+                end_time=None,
+                is_all_day=False,
+                source_quote="Quick Checks at 8AM the morning of lecture with nearly every topic",
+                source_page=1,
+                confidence="high",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+            )
+        ],
+        recurring_rules=[
+            RecurringRule(
+                title="Quick Checks",
+                event_type="quiz",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=time(8, 0),
+                end_time=None,
+                is_all_day=False,
+                boundary_start=date(2025, 8, 25),
+                boundary_end=date(2025, 12, 19),
+                exclusion_dates=[],
+                source_quote="Quick Checks at 8AM the morning of lecture with nearly every topic",
+                source_page=1,
+                confidence="high",
+                anchor_title="Lecture",
+                offset_days=0,
+                uncertainty_reason=None,
+                expansion_mode="review_only",
+            )
+        ],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs["model"])
+            return SimpleNamespace(output_parsed=luna_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.fallback_used is False
+        events = persisted.document.semester.events
+        assert [event.title for event in events] == ["Quick Checks"]
+        event = events[0]
+        assert event.recurring_series_id is None
+        assert event.warning_codes == ["DATE_MISSING", "AMBIGUOUS_RECURRENCE"]
+        assert event.warning_reason == (
+            "The syllabus uses ambiguous recurrence wording, so exact dates were not generated."
+        )
+        assert event.derivation_summary == (
+            "Dates were not generated because the syllabus does not identify every occurrence."
+        )
+        assert event.confidence.value == "medium"
+
+    assert calls == ["gpt-5.6-luna"]
+
+
+def test_process_job_uses_single_terra_call_for_missing_deterministic_recurring_rule(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    calls: list[str] = []
+    terra_instructions: list[str] = []
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2026",
+            start_date=date(2026, 8, 24),
+            end_date=date(2026, 12, 18),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="cs101.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/cs101.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf("Homework due every Friday from Sep 4, 2026 through Sep 18, 2026. " * 4)
+    )
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Introduction to Computer Science",
+        instructor=None,
+        events=[],
+        recurring_rules=[],
+    )
+    terra_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Introduction to Computer Science",
+        instructor=None,
+        events=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Homework",
+                event_type="assignment",
+                rule_kind="weekly_fixed",
+                weekday="friday",
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                boundary_start=date(2026, 9, 4),
+                boundary_end=date(2026, 9, 18),
+                exclusion_dates=[],
+                source_quote="Homework due every Friday from Sep 4, 2026 through Sep 18, 2026",
+                source_page=1,
+                confidence="high",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason=None,
+                expansion_mode="exact",
+            )
+        ],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "gpt-5.6-luna":
+                return SimpleNamespace(output_parsed=luna_output)
+            terra_instructions.append(kwargs["instructions"])
+            return SimpleNamespace(output_parsed=terra_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.fallback_used is True
+        assert persisted.fallback_reason_codes == ["RECURRING_RULE_MISSING"]
+        events = sorted(persisted.document.semester.events, key=lambda item: item.event_date)
+        assert [event.event_date for event in events] == [
+            date(2026, 9, 4),
+            date(2026, 9, 11),
+            date(2026, 9, 18),
+        ]
+
+    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert "recover missing schedule anchors or recurring rules" in terra_instructions[0]
+
+
+def test_process_job_does_not_trigger_terra_for_ambiguous_recurring_standalone_candidate(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    calls: list[str] = []
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 19),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="fall2025.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/fall2025.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf("Quick Checks at 8AM the morning of lecture with nearly every topic. " * 4)
+    )
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Quick Checks",
+                event_type="quiz",
+                event_date=None,
+                start_time=time(8, 0),
+                end_time=None,
+                is_all_day=False,
+                source_quote="Quick Checks at 8AM the morning of lecture with nearly every topic",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+            )
+        ],
+        recurring_rules=[],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs["model"])
+            return SimpleNamespace(output_parsed=luna_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
+        assert persisted.document.semester.events[0].title == "Quick Checks"
+
+    assert calls == ["gpt-5.6-luna"]
+
+
+def test_process_job_merges_multiple_fallback_reasons_into_one_terra_call(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    calls: list[str] = []
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2026",
+            start_date=date(2026, 8, 24),
+            end_date=date(2026, 12, 18),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="cs101.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/cs101.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf(
+            "Final exam December 16, 2026 as scheduled by Registrar. "
+            "Homework due every Friday from Sep 4, 2026 through Sep 18, 2026. " * 4
+        )
+    )
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Introduction to Computer Science",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Final exam",
+                event_type="exam",
+                event_date=date(2026, 12, 16),
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Registrar will announce the final exam later",
+                source_page=1,
+                confidence="low",
+                year_was_explicit=True,
+                uncertainty_reason="The source wording is tentative.",
+            )
+        ],
+        recurring_rules=[],
+    )
+    terra_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Introduction to Computer Science",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Final exam",
+                event_type="exam",
+                event_date=date(2026, 12, 16),
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Final exam December 16, 2026 as scheduled by Registrar",
+                source_page=1,
+                confidence="high",
+                year_was_explicit=True,
+                uncertainty_reason=None,
+            )
+        ],
+        recurring_rules=[
+            RecurringRule(
+                title="Homework",
+                event_type="assignment",
+                rule_kind="weekly_fixed",
+                weekday="friday",
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                boundary_start=date(2026, 9, 4),
+                boundary_end=date(2026, 9, 18),
+                exclusion_dates=[],
+                source_quote="Homework due every Friday from Sep 4, 2026 through Sep 18, 2026",
+                source_page=1,
+                confidence="high",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason=None,
+                expansion_mode="exact",
+            )
+        ],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "gpt-5.6-luna":
+                return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=terra_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.fallback_used is True
+        assert persisted.fallback_reason_codes == [
+            "LOW_CONFIDENCE",
+            "SOURCE_MISMATCH",
+            "RECURRING_RULE_MISSING",
+        ]
+
+    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+
+
 def test_expand_recurring_rules_honors_boundaries_exclusions_dedupes_and_caps():
     anchor = ScheduleAnchor(
         title="Lecture",

@@ -35,14 +35,26 @@ RETRYABLE_TERRA_CODES = {
     "SOURCE_MISMATCH",
     "SOURCE_PAGE_MISSING",
     "DATE_CONFLICT",
+    "RECURRING_RULE_MISSING",
 }
 RETRYABLE_TERRA_CODE_ORDER = {
     "LOW_CONFIDENCE": 0,
     "SOURCE_MISMATCH": 1,
     "SOURCE_PAGE_MISSING": 2,
     "DATE_CONFLICT": 3,
-    "TERRA_RETRY_FAILED": 4,
+    "RECURRING_RULE_MISSING": 4,
+    "TERRA_RETRY_FAILED": 5,
 }
+AMBIGUOUS_RECURRENCE_PATTERN = re.compile(
+    r"\b(?:nearly every|usually|periodically|may)\b",
+    re.IGNORECASE,
+)
+DETERMINISTIC_RECURRING_RULE_PATTERN = re.compile(
+    r"(?P<title>[A-Za-z0-9 &/\-]{1,120}?)\s+"
+    r"(?P<action>due|scheduled)\s+"
+    r"(?P<cue>every|each|weekly)\b",
+    re.IGNORECASE,
+)
 
 
 def resolve_recurring_series_id(
@@ -83,6 +95,14 @@ class CandidateEvent(BaseModel):
     review_status: ReviewStatus = ReviewStatus.NEEDS_REVIEW
 
 
+class ScheduleOccurrence(BaseModel):
+    occurrence_date: date
+    title: str = Field(min_length=1, max_length=240)
+    anchor_type: Literal["lecture", "lab", "discussion", "class", "other"] = "class"
+    source_quote: str = Field(min_length=1)
+    source_page: int = Field(ge=1)
+
+
 class ScheduleAnchor(BaseModel):
     title: str = Field(min_length=1, max_length=240)
     anchor_type: Literal["lecture", "lab", "discussion", "class", "other"] = "class"
@@ -96,6 +116,7 @@ class ScheduleAnchor(BaseModel):
     exclusion_dates: list[date] = Field(default_factory=list)
     source_quote: str = Field(min_length=1)
     source_page: int = Field(ge=1)
+    occurrences: list[ScheduleOccurrence] = Field(default_factory=list)
 
 
 class RecurringRule(BaseModel):
@@ -120,6 +141,7 @@ class RecurringRule(BaseModel):
     offset_days: int | None = None
     uncertainty_reason: str | None = None
     extraction_model: str | None = None
+    expansion_mode: Literal["exact", "review_only"] = "exact"
 
 
 class ExpandedRecurringSeries(BaseModel):
@@ -461,6 +483,23 @@ def _anchor_occurrences(
     range_end = min(semester_end, anchor.boundary_end or semester_end)
     if range_start > range_end:
         return []
+    exclusions = set(anchor.exclusion_dates)
+    explicit_dates = sorted(
+        {
+            occurrence.occurrence_date
+            for occurrence in anchor.occurrences
+            if occurrence.anchor_type == anchor.anchor_type
+            and range_start <= occurrence.occurrence_date <= range_end
+            and occurrence.occurrence_date not in exclusions
+        }
+    )
+    if explicit_dates:
+        return explicit_dates
+
+    range_start = max(semester_start, anchor.boundary_start or semester_start)
+    range_end = min(semester_end, anchor.boundary_end or semester_end)
+    if range_start > range_end:
+        return []
     current = range_start
     while current.weekday() != WEEKDAY_INDEX[anchor.weekday]:
         current = current.fromordinal(current.toordinal() + 1)
@@ -504,7 +543,129 @@ def _build_rule_payload(rule: RecurringRule) -> dict:
         "is_all_day": rule.is_all_day,
         "anchor_title": rule.anchor_title,
         "offset_days": rule.offset_days,
+        "expansion_mode": rule.expansion_mode,
     }
+
+
+def _is_ambiguous_recurrence_text(value: str) -> bool:
+    return bool(AMBIGUOUS_RECURRENCE_PATTERN.search(value))
+
+
+def _cap_confidence_for_ambiguous_recurrence(confidence: ConfidenceLevel) -> ConfidenceLevel:
+    if confidence == ConfidenceLevel.HIGH:
+        return ConfidenceLevel.MEDIUM
+    return confidence
+
+
+def _normalize_ambiguous_recurring_content(
+    extraction: SyllabusExtraction,
+) -> tuple[SyllabusExtraction, set[int], str]:
+    events = [event.model_copy(deep=True) for event in extraction.events]
+    rules = [rule.model_copy(deep=True) for rule in extraction.recurring_rules]
+    normalized_event_indexes: set[int] = set()
+    ambiguous_reason = (
+        "The syllabus uses ambiguous recurrence wording, so exact dates were not generated."
+    )
+    derivation_summary = (
+        "Dates were not generated because the syllabus does not identify every occurrence."
+    )
+
+    def normalize_event(event: CandidateEvent) -> CandidateEvent:
+        return event.model_copy(
+            update={
+                "event_date": None,
+                "recurring_series_id": None,
+                "confidence": _cap_confidence_for_ambiguous_recurrence(event.confidence),
+                "derivation_summary": derivation_summary,
+                "review_status": ReviewStatus.NEEDS_REVIEW,
+            }
+        )
+
+    for rule_index, rule in enumerate(rules):
+        if not _is_ambiguous_recurrence_text(rule.source_quote):
+            continue
+        rules[rule_index] = rule.model_copy(
+            update={
+                "expansion_mode": "review_only",
+                "confidence": _cap_confidence_for_ambiguous_recurrence(rule.confidence),
+            }
+        )
+        normalized_title = _normalize_title(rule.title)
+        event_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if _normalize_title(event.title) == normalized_title
+            ),
+            None,
+        )
+        if event_index is None:
+            events.append(
+                CandidateEvent(
+                    title=rule.title,
+                    event_type=rule.event_type,
+                    event_date=None,
+                    start_time=rule.start_time,
+                    end_time=rule.end_time,
+                    is_all_day=rule.is_all_day,
+                    source_quote=rule.source_quote,
+                    source_page=rule.source_page,
+                    confidence=_cap_confidence_for_ambiguous_recurrence(rule.confidence),
+                    year_was_explicit=True,
+                    uncertainty_reason=rule.uncertainty_reason,
+                    extraction_model=rule.extraction_model,
+                    derivation_summary=derivation_summary,
+                    review_status=ReviewStatus.NEEDS_REVIEW,
+                )
+            )
+            normalized_event_indexes.add(len(events) - 1)
+        else:
+            events[event_index] = normalize_event(events[event_index])
+            normalized_event_indexes.add(event_index)
+
+    for index, event in enumerate(events):
+        if event.event_date is None and _is_ambiguous_recurrence_text(event.source_quote):
+            events[index] = normalize_event(event)
+            normalized_event_indexes.add(index)
+
+    return (
+        SyllabusExtraction(
+            course_code=extraction.course_code,
+            course_name=extraction.course_name,
+            instructor=extraction.instructor,
+            events=events,
+            schedule_anchors=[anchor.model_copy(deep=True) for anchor in extraction.schedule_anchors],
+            recurring_rules=rules,
+        ),
+        normalized_event_indexes,
+        ambiguous_reason,
+    )
+
+
+def _detect_missing_recurring_rule(
+    extraction: SyllabusExtraction | SyllabusRepair,
+    pages: list[dict],
+) -> list[str]:
+    existing_rule_titles = {_normalize_title(rule.title) for rule in extraction.recurring_rules}
+    existing_event_titles = {_normalize_title(event.title) for event in extraction.events}
+    missing_titles: list[str] = []
+
+    for page in pages:
+        for raw_segment in re.split(r"[\n.]+", page["text"]):
+            segment = raw_segment.strip()
+            if not segment or _is_ambiguous_recurrence_text(segment):
+                continue
+            match = DETERMINISTIC_RECURRING_RULE_PATTERN.search(segment)
+            if match is None:
+                continue
+            title = _normalize_title(match.group("title").strip(" :-"))
+            if not title:
+                continue
+            if title in existing_rule_titles or title in existing_event_titles:
+                continue
+            missing_titles.append(title)
+
+    return _ordered_unique(missing_titles)
 
 
 def expand_recurring_rules(
@@ -527,6 +688,8 @@ def expand_recurring_rules(
     derived_events: list[CandidateEvent] = []
 
     for rule in rules:
+        if rule.expansion_mode == "review_only":
+            continue
         range_start = max(semester_start, rule.boundary_start or semester_start)
         range_end = min(semester_end, rule.boundary_end or semester_end)
         if range_start > range_end:
@@ -563,6 +726,9 @@ def expand_recurring_rules(
                     "exclusion_dates": [item.isoformat() for item in anchor.exclusion_dates],
                     "source_quote": anchor.source_quote,
                     "source_page": anchor.source_page,
+                    "occurrences": [
+                        occurrence.model_dump(mode="json") for occurrence in anchor.occurrences
+                    ],
                 }
             ]
             occurrence_dates = []
@@ -678,6 +844,13 @@ def _preview_retryable_codes(
                 f"{index}] title={rule.title!r} "
                 f"codes={_ordered_retryable_codes(matched_codes)}"
             )
+    missing_titles = _detect_missing_recurring_rule(extraction, pages)
+    if missing_titles:
+        retryable_codes.append("RECURRING_RULE_MISSING")
+        flagged_reasons["rules"].append(
+            "missing recurring rules for titles="
+            f"{missing_titles}"
+        )
     return (
         _ordered_retryable_codes(retryable_codes),
         flagged_event_indexes,
@@ -724,8 +897,10 @@ def _parse_repair_with_openai(
             instructions=(
                 "Repair only the extracted items that failed deterministic validation. "
                 f"Focus on these warning codes {repair_summary}. "
-                "Keep other validated items unchanged. Return only repaired events, "
-                "schedule_anchors, and recurring_rules that should replace the flagged items. "
+                "Keep other validated Luna items unchanged. Explicitly recover missing "
+                "schedule anchors or recurring rules when the validation notes say they are "
+                "missing. Return only repaired events, schedule_anchors, and recurring_rules "
+                "that should replace flagged items or add missing recurring data. "
                 f"Flagged event indexes {sorted(flagged_event_indexes)}. "
                 f"Flagged rule indexes {sorted(flagged_rule_indexes)}. "
                 "Validation detail "
@@ -988,6 +1163,9 @@ def process_job(
                 job.primary_model = None
                 job.fallback_model = None
 
+            extraction, ambiguous_event_indexes, ambiguous_warning_reason = (
+                _normalize_ambiguous_recurring_content(extraction)
+            )
             job.fallback_used = fallback_used
             job.fallback_reason_codes = fallback_reason_codes
             _update_job(session, job, JobStatus.VALIDATING, "Checking dates and source evidence")
@@ -1066,7 +1244,12 @@ def process_job(
                 series_map[series_payload.id] = series_payload
 
             seen: set[tuple[str, date | None]] = set()
-            for candidate in [*extraction.events, *derived_candidates]:
+            persisted_candidates = [
+                (index, candidate, True) for index, candidate in enumerate(extraction.events)
+            ] + [
+                (None, candidate, False) for candidate in derived_candidates
+            ]
+            for candidate_index, candidate, is_primary_event in persisted_candidates:
                 recurring_series_id = resolve_recurring_series_id(candidate, series_map.keys())
                 if candidate.recurring_series_id != recurring_series_id:
                     candidate = candidate.model_copy(
@@ -1091,6 +1274,9 @@ def process_job(
                         ]
                         if part
                     )
+                if is_primary_event and candidate_index in ambiguous_event_indexes:
+                    warning_codes.append("AMBIGUOUS_RECURRENCE")
+                    warning_reason = ambiguous_warning_reason
                 duplicate_key = (normalized_title, candidate.event_date)
                 if duplicate_key in seen:
                     warning_codes.append("POSSIBLE_DUPLICATE")
