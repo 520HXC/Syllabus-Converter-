@@ -453,7 +453,40 @@ def test_course_color_can_be_corrected_during_review_and_persists(app_client):
     assert refreshed_review.json()["courses"][0]["color"] == "#2563EB"
 
 
-@pytest.mark.parametrize("payload", [{"color": None}, {"color": "2563EB"}, {"color": "#2563eb"}])
+def test_course_color_accepts_lowercase_hex_and_persists(app_client):
+    client, app = app_client
+    semester_id, _, _ = seed_review_data(app)
+    review = client.get(f"/api/semesters/{semester_id}/review", headers=auth_headers()).json()
+    course_id = review["courses"][0]["id"]
+
+    response = client.patch(
+        f"/api/courses/{course_id}",
+        headers=auth_headers(),
+        json={"color": "#0d9488"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["color"] == "#0d9488"
+
+    refreshed_review = client.get(
+        f"/api/semesters/{semester_id}/review",
+        headers=auth_headers(),
+    )
+
+    assert refreshed_review.status_code == 200
+    assert refreshed_review.json()["courses"][0]["color"] == "#0d9488"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"color": None},
+        {"color": "2563EB"},
+        {"color": "#12345"},
+        {"color": "#1234567"},
+        {"color": "#12FG56"},
+    ],
+)
 def test_course_color_update_rejects_null_and_invalid_values(app_client, payload):
     client, app = app_client
     semester_id, _, _ = seed_review_data(app)
