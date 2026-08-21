@@ -2565,6 +2565,350 @@ def test_expand_recurring_rules_keeps_exact_class_rule_with_range_and_time():
     ]
 
 
+def test_expand_recurring_rules_matches_generic_anchor_titles_across_sections():
+    monday_section = ScheduleAnchor(
+        title="ALEC lecture",
+        anchor_type="lecture",
+        weekday="monday",
+        start_time=time(11, 0),
+        end_time=time(12, 20),
+        boundary_start=date(2025, 9, 3),
+        boundary_end=date(2025, 9, 10),
+        exclusion_dates=[],
+        source_quote="ALEC MW 11:00am - 12:20pm",
+        source_page=1,
+    )
+    wednesday_section = ScheduleAnchor(
+        title="ALEC lecture",
+        anchor_type="lecture",
+        weekday="wednesday",
+        start_time=time(11, 0),
+        end_time=time(12, 20),
+        boundary_start=date(2025, 9, 3),
+        boundary_end=date(2025, 9, 10),
+        exclusion_dates=[],
+        source_quote="ALEC MW 11:00am - 12:20pm",
+        source_page=1,
+    )
+    duplicate_monday_section = ScheduleAnchor(
+        title="BLEC lecture",
+        anchor_type="lecture",
+        weekday="monday",
+        start_time=time(11, 0),
+        end_time=time(12, 20),
+        boundary_start=date(2025, 9, 3),
+        boundary_end=date(2025, 9, 10),
+        exclusion_dates=[],
+        source_quote="BLEC MW 11:00am - 12:20pm",
+        source_page=1,
+    )
+    quick_checks = RecurringRule(
+        title="Quick Checks",
+        event_type="quiz",
+        rule_kind="relative_to_anchor",
+        weekday=None,
+        start_time=time(8, 0),
+        end_time=None,
+        is_all_day=False,
+        boundary_start=date(2025, 9, 3),
+        boundary_end=date(2025, 9, 10),
+        exclusion_dates=[],
+        source_quote="Quick Checks due at 8AM on lecture day",
+        source_page=2,
+        confidence="high",
+        anchor_title="Lecture",
+        offset_days=0,
+        uncertainty_reason=None,
+    )
+
+    series, derived_events = expand_recurring_rules(
+        anchors=[monday_section, wednesday_section, duplicate_monday_section],
+        rules=[quick_checks],
+        semester_start=date(2025, 8, 24),
+        semester_end=date(2025, 12, 18),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert len(series) == 1
+    assert [event.event_date for event in derived_events] == [
+        date(2025, 9, 3),
+        date(2025, 9, 8),
+        date(2025, 9, 10),
+    ]
+    assert len(series[0].anchor_sources) == 3
+
+
+def test_preview_retryable_codes_flags_exact_relative_rule_without_matching_anchor():
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Intro to CS",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Lecture reflection",
+                event_type="assignment",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                boundary_start=date(2025, 9, 3),
+                boundary_end=date(2025, 12, 10),
+                exclusion_dates=[],
+                source_quote="Reflection due two days after lecture",
+                source_page=1,
+                confidence="high",
+                anchor_title="Lecture",
+                offset_days=2,
+                uncertainty_reason=None,
+                expansion_mode="exact",
+            )
+        ],
+    )
+
+    retryable_codes, _, flagged_rule_indexes, flagged_reasons = processing._preview_retryable_codes(
+        extraction,
+        pages=[
+            {
+                "page": 1,
+                "ocr": False,
+                "text": "Reflection due two days after lecture",
+            }
+        ],
+        semester_start=date(2025, 8, 24),
+        semester_end=date(2025, 12, 18),
+        known_dates_by_title={},
+    )
+
+    assert retryable_codes == ["ANCHOR_NOT_FOUND"]
+    assert flagged_rule_indexes == {0}
+    assert "ANCHOR_NOT_FOUND" in flagged_reasons["rules"][0]
+
+
+def test_process_job_review_only_relative_rule_without_anchor_skips_terra(app_client, monkeypatch):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    calls: list[str] = []
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 19),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="review-only-no-anchor.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/review-only-no-anchor.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf(
+            "Quick Checks - 8AM the morning of the lecture. "
+            "Nearly every topic includes a quick check. " * 4
+        )
+    )
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Intro to CS",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Quick Checks",
+                event_type="quiz",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=time(8, 0),
+                end_time=None,
+                is_all_day=False,
+                boundary_start=date(2025, 8, 25),
+                boundary_end=date(2025, 12, 19),
+                exclusion_dates=[],
+                source_quote="Quick Checks - 8AM the morning of the lecture",
+                source_page=1,
+                confidence="high",
+                anchor_title="Lecture",
+                offset_days=0,
+                uncertainty_reason=None,
+                expansion_mode="review_only",
+            )
+        ],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs["model"])
+            return SimpleNamespace(output_parsed=luna_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
+        assert len(persisted.document.semester.events) == 1
+
+    assert calls == ["gpt-5.6-luna"]
+
+
+def test_process_job_materializes_unresolved_exact_relative_rule_without_anchor(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    calls: list[str] = []
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 19),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="missing-anchor.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/missing-anchor.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(make_pdf("Reflection due two days after lecture. " * 4))
+
+    luna_output = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Intro to CS",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Lecture reflection",
+                event_type="assignment",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                boundary_start=date(2025, 8, 25),
+                boundary_end=date(2025, 12, 19),
+                exclusion_dates=[],
+                source_quote="Reflection due two days after lecture",
+                source_page=1,
+                confidence="high",
+                anchor_title="Lecture",
+                offset_days=2,
+                uncertainty_reason=None,
+                expansion_mode="exact",
+            )
+        ],
+    )
+    terra_output = processing.SyllabusRepair(
+        course_code="CS 101",
+        course_name="Intro to CS",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs["model"])
+            if kwargs["model"] == "gpt-5.6-luna":
+                return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=terra_output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.fallback_used is True
+        assert persisted.fallback_reason_codes == ["ANCHOR_NOT_FOUND", "TERRA_RETRY_FAILED"]
+        events = persisted.document.semester.events
+        assert len(events) == 1
+        event = events[0]
+        assert event.title == "Lecture reflection"
+        assert event.event_date is None
+        assert event.recurring_series_id is None
+        assert "TERRA_RETRY_FAILED" in event.warning_codes
+        assert event.fallback_reason_codes == ["TERRA_RETRY_FAILED"]
+
+    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+
+
 def test_expand_recurring_rules_honors_boundaries_exclusions_dedupes_and_caps():
     anchor = ScheduleAnchor(
         title="Lecture",

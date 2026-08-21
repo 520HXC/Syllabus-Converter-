@@ -36,6 +36,7 @@ RETRYABLE_TERRA_CODES = {
     "SOURCE_PAGE_MISSING",
     "DATE_CONFLICT",
     "RECURRING_RULE_MISSING",
+    "ANCHOR_NOT_FOUND",
 }
 RETRYABLE_TERRA_CODE_ORDER = {
     "LOW_CONFIDENCE": 0,
@@ -43,7 +44,8 @@ RETRYABLE_TERRA_CODE_ORDER = {
     "SOURCE_PAGE_MISSING": 2,
     "DATE_CONFLICT": 3,
     "RECURRING_RULE_MISSING": 4,
-    "TERRA_RETRY_FAILED": 5,
+    "ANCHOR_NOT_FOUND": 5,
+    "TERRA_RETRY_FAILED": 6,
 }
 AMBIGUOUS_RECURRENCE_PATTERN = re.compile(
     r"\b(?:nearly every|usually|periodically)\b",
@@ -69,6 +71,7 @@ COURSE_STRUCTURE_PATTERN = re.compile(
     r"\b(?:course structure|this course includes|lecture sections?|lab section)\b",
     re.IGNORECASE,
 )
+GENERIC_ANCHOR_TYPES = {"lecture", "lab", "discussion", "class", "other"}
 
 
 def resolve_recurring_series_id(
@@ -476,7 +479,49 @@ def _rule_summary(rule: RecurringRule) -> str:
     return f"{offset} day(s) after {anchor_title}"
 
 
-def _validate_rule(rule: RecurringRule, pages: list[dict]) -> tuple[list[str], str | None]:
+def _find_matching_anchors(
+    rule: RecurringRule,
+    anchors: list[ScheduleAnchor],
+) -> list[ScheduleAnchor]:
+    if rule.anchor_title is None:
+        return []
+
+    normalized_anchor_title = _normalize_title(rule.anchor_title)
+    exact_matches = [
+        anchor for anchor in anchors if _normalize_title(anchor.title) == normalized_anchor_title
+    ]
+    if exact_matches:
+        return exact_matches
+
+    if normalized_anchor_title in GENERIC_ANCHOR_TYPES:
+        generic_matches = [
+            anchor for anchor in anchors if anchor.anchor_type == normalized_anchor_title
+        ]
+        if generic_matches:
+            return generic_matches
+
+    return [
+        anchor
+        for anchor in anchors
+        if normalized_anchor_title in _normalize_title(anchor.title)
+        or anchor.anchor_type in normalized_anchor_title.split()
+    ]
+
+
+def _requires_exact_anchor(rule: RecurringRule) -> bool:
+    return bool(
+        rule.rule_kind == "relative_to_anchor"
+        and rule.expansion_mode == "exact"
+        and rule.anchor_title is not None
+        and rule.offset_days is not None
+    )
+
+
+def _validate_rule(
+    rule: RecurringRule,
+    pages: list[dict],
+    anchors: list[ScheduleAnchor],
+) -> tuple[list[str], str | None]:
     codes: list[str] = []
     reasons: list[str] = []
     source_page = next((page for page in pages if page["page"] == rule.source_page), None)
@@ -492,6 +537,13 @@ def _validate_rule(rule: RecurringRule, pages: list[dict]) -> tuple[list[str], s
     elif rule.uncertainty_reason:
         codes.append("MODEL_UNCERTAINTY")
         reasons.append(rule.uncertainty_reason)
+    if (
+        _requires_exact_anchor(rule)
+        and not _rule_requires_review_only(rule, pages)
+        and not _find_matching_anchors(rule, anchors)
+    ):
+        codes.append("ANCHOR_NOT_FOUND")
+        reasons.append("The recurring rule refers to a schedule anchor that could not be matched.")
     return codes, " ".join(dict.fromkeys(reasons)) or None
 
 
@@ -919,7 +971,6 @@ def expand_recurring_rules(
         for event in explicit_events
         if event.event_date is not None
     }
-    anchor_map = {_normalize_title(anchor.title): anchor for anchor in anchors}
     series_payloads: list[ExpandedRecurringSeries] = []
     derived_events: list[CandidateEvent] = []
 
@@ -943,40 +994,45 @@ def expand_recurring_rules(
         else:
             if rule.anchor_title is None or rule.offset_days is None:
                 continue
-            anchor = anchor_map.get(_normalize_title(rule.anchor_title))
-            if anchor is None:
+            matching_anchors = _find_matching_anchors(rule, anchors)
+            if not matching_anchors:
                 continue
-            anchor_sources = [
-                {
-                    "title": anchor.title,
-                    "anchor_type": anchor.anchor_type,
-                    "weekday": anchor.weekday,
-                    "start_time": anchor.start_time.isoformat() if anchor.start_time else None,
-                    "end_time": anchor.end_time.isoformat() if anchor.end_time else None,
-                    "boundary_start": anchor.boundary_start.isoformat()
-                    if anchor.boundary_start
-                    else None,
-                    "boundary_end": anchor.boundary_end.isoformat()
-                    if anchor.boundary_end
-                    else None,
-                    "exclusion_dates": [item.isoformat() for item in anchor.exclusion_dates],
-                    "source_quote": anchor.source_quote,
-                    "source_page": anchor.source_page,
-                    "occurrences": [
-                        occurrence.model_dump(mode="json") for occurrence in anchor.occurrences
-                    ],
-                }
-            ]
+            anchor_sources = []
             occurrence_dates = []
             exclusions = set(rule.exclusion_dates)
-            for anchor_date in _anchor_occurrences(anchor, semester_start, semester_end):
-                derived_date = anchor_date.fromordinal(anchor_date.toordinal() + rule.offset_days)
-                if range_start <= derived_date <= range_end and derived_date not in exclusions:
-                    occurrence_dates.append(derived_date)
+            for anchor in matching_anchors:
+                anchor_sources.append(
+                    {
+                        "title": anchor.title,
+                        "anchor_type": anchor.anchor_type,
+                        "weekday": anchor.weekday,
+                        "start_time": anchor.start_time.isoformat() if anchor.start_time else None,
+                        "end_time": anchor.end_time.isoformat() if anchor.end_time else None,
+                        "boundary_start": anchor.boundary_start.isoformat()
+                        if anchor.boundary_start
+                        else None,
+                        "boundary_end": anchor.boundary_end.isoformat()
+                        if anchor.boundary_end
+                        else None,
+                        "exclusion_dates": [item.isoformat() for item in anchor.exclusion_dates],
+                        "source_quote": anchor.source_quote,
+                        "source_page": anchor.source_page,
+                        "occurrences": [
+                            occurrence.model_dump(mode="json")
+                            for occurrence in anchor.occurrences
+                        ],
+                    }
+                )
+                for anchor_date in _anchor_occurrences(anchor, semester_start, semester_end):
+                    derived_date = anchor_date.fromordinal(
+                        anchor_date.toordinal() + rule.offset_days
+                    )
+                    if range_start <= derived_date <= range_end and derived_date not in exclusions:
+                        occurrence_dates.append(derived_date)
 
         deduped_dates: list[date] = []
         seen_dates: set[date] = set()
-        for occurrence_date in occurrence_dates:
+        for occurrence_date in sorted(occurrence_dates):
             key = (_normalize_title(rule.title), occurrence_date)
             if key in explicit_keys or occurrence_date in seen_dates:
                 continue
@@ -1070,7 +1126,7 @@ def _preview_retryable_codes(
             )
     flagged_rule_indexes: set[int] = set()
     for index, rule in enumerate(extraction.recurring_rules):
-        warning_codes, _ = _validate_rule(rule, pages)
+        warning_codes, _ = _validate_rule(rule, pages, extraction.schedule_anchors)
         matched_codes = [code for code in warning_codes if code in RETRYABLE_TERRA_CODES]
         if matched_codes:
             flagged_rule_indexes.add(index)
@@ -1215,6 +1271,19 @@ def _merge_extractions(
     )
 
 
+def _find_unresolved_exact_anchor_rules(
+    extraction: SyllabusExtraction,
+    pages: list[dict],
+) -> list[RecurringRule]:
+    return [
+        rule
+        for rule in extraction.recurring_rules
+        if _requires_exact_anchor(rule)
+        and not _rule_requires_review_only(rule, pages)
+        and not _find_matching_anchors(rule, extraction.schedule_anchors)
+    ]
+
+
 def _extract_with_model_fallback(
     pages: list[dict],
     settings: Settings,
@@ -1262,7 +1331,8 @@ def _extract_with_model_fallback(
         _apply_extraction_model(repair, settings.openai_fallback_model)
         merged = _merge_extractions(primary, repair, flagged_event_indexes, flagged_rule_indexes)
         unresolved_missing_candidates = _find_missing_recurring_rule_candidates(merged, pages)
-        if not unresolved_missing_candidates:
+        unresolved_anchor_rules = _find_unresolved_exact_anchor_rules(merged, pages)
+        if not unresolved_missing_candidates and not unresolved_anchor_rules:
             return merged, True, retryable_codes, set()
         merged_events = [event.model_copy(deep=True) for event in merged.events]
         failed_repair_keys: set[tuple[str, date | None]] = set()
@@ -1314,6 +1384,55 @@ def _extract_with_model_fallback(
                         "review_status": ReviewStatus.NEEDS_REVIEW,
                     }
                 )
+            failed_repair_keys.add((_normalize_title(merged_events[event_index].title), None))
+        for rule in unresolved_anchor_rules:
+            stable_title = _stable_title_key(rule.title)
+            event_index = next(
+                (
+                    index
+                    for index, event in enumerate(merged_events)
+                    if _stable_title_key(event.title) == stable_title
+                    and event.event_date is None
+                ),
+                None,
+            )
+            update = {
+                "title": _display_title(rule.title),
+                "event_date": None,
+                "recurring_series_id": None,
+                "source_quote": rule.source_quote,
+                "source_page": rule.source_page,
+                "extraction_model": settings.openai_fallback_model,
+                "derivation_summary": (
+                    "Dates were not generated because the referenced schedule anchor "
+                    "could not be resolved."
+                ),
+                "review_status": ReviewStatus.NEEDS_REVIEW,
+            }
+            if event_index is None:
+                merged_events.append(
+                    CandidateEvent(
+                        title=_display_title(rule.title),
+                        event_type=rule.event_type,
+                        event_date=None,
+                        start_time=rule.start_time,
+                        end_time=rule.end_time,
+                        is_all_day=rule.is_all_day,
+                        source_quote=rule.source_quote,
+                        source_page=rule.source_page,
+                        confidence=_cap_confidence_for_ambiguous_recurrence(rule.confidence),
+                        year_was_explicit=True,
+                        uncertainty_reason=(
+                            "The referenced schedule anchor could not be matched."
+                        ),
+                        extraction_model=settings.openai_fallback_model,
+                        derivation_summary=update["derivation_summary"],
+                        review_status=ReviewStatus.NEEDS_REVIEW,
+                    )
+                )
+                event_index = len(merged_events) - 1
+            else:
+                merged_events[event_index] = merged_events[event_index].model_copy(update=update)
             failed_repair_keys.add((_normalize_title(merged_events[event_index].title), None))
         return (
             merged.model_copy(update={"events": merged_events}),
@@ -1519,7 +1638,11 @@ def process_job(
                     if rule.title == series_payload.title
                     and rule.rule_kind == series_payload.rule_kind
                 )
-                warning_codes, warning_reason = _validate_rule(matching_rule, pages)
+                warning_codes, warning_reason = _validate_rule(
+                    matching_rule,
+                    pages,
+                    extraction.schedule_anchors,
+                )
                 series_record = RecurringEventSeries(
                     id=series_payload.id,
                     user_id=job.user_id,
