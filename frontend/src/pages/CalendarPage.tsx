@@ -11,7 +11,6 @@ import {
   FileUp,
   Filter,
   List,
-  Palette,
   PanelLeftOpen,
 } from "lucide-react"
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom"
@@ -544,6 +543,7 @@ export function CalendarPage() {
                 <div className="mt-4 grid gap-2">
                   {courses.map((course) => {
                     const courseLabel = course.code || course.name
+                    const checkboxId = `course-filter-checkbox-${course.id}`
                     const courseColor = courseDisplayColors.get(course.id) ?? course.color
                     const courseColorError = courseColorErrors[course.id]
                     const isPickerOpen = expandedCourseColorId === course.id
@@ -557,21 +557,6 @@ export function CalendarPage() {
                         key={course.id}
                       >
                         <div className="flex items-center gap-2">
-                          <label className="flex min-h-11 min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-2xl px-1 py-1 text-sm font-medium text-text-muted">
-                            <input
-                              aria-label={courseLabel}
-                              checked={selectedCourseIds.has(course.id)}
-                              className="size-4 accent-accent"
-                              onChange={() => toggleCourse(course.id)}
-                              type="checkbox"
-                            />
-                            <span
-                              className="size-2.5 shrink-0 rounded-full"
-                              data-testid={`course-filter-swatch-${course.id}`}
-                              style={{ backgroundColor: courseColor }}
-                            />
-                            <span className="truncate">{courseLabel}</span>
-                          </label>
                           <div className="relative shrink-0">
                             <button
                               aria-controls={isPickerOpen ? `course-color-picker-${course.id}` : undefined}
@@ -579,19 +564,24 @@ export function CalendarPage() {
                               aria-haspopup="dialog"
                               aria-label={`Change color for ${courseLabel}`}
                               className={cn(
-                                "inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 bg-panel px-3 text-text transition-colors hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
+                                "inline-flex min-h-11 min-w-11 items-center justify-center rounded-2xl border border-border/80 bg-panel px-3 transition-colors hover:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
                                 isPickerOpen && "border-accent text-accent",
                               )}
-                              data-testid={`course-color-trigger-${course.id}`}
+                              data-testid={`course-color-button-${course.id}`}
                               onClick={() => toggleCourseColorPalette(course.id)}
                               type="button"
                             >
-                              <Palette aria-hidden="true" className="size-4" />
+                              <span
+                                aria-hidden="true"
+                                className="size-5 rounded-full border border-white/60 shadow-sm"
+                                data-testid={`course-filter-swatch-${course.id}`}
+                                style={{ backgroundColor: courseColor }}
+                              />
                             </button>
                             {isPickerOpen ? (
                               <div
                                 aria-label={`Choose a color for ${courseLabel}`}
-                                className="absolute right-0 z-20 mt-2 w-60 rounded-2xl border border-border/80 bg-panel p-3 shadow-panel"
+                                className="absolute left-0 z-20 mt-2 w-[min(15rem,calc(100vw-2rem))] rounded-2xl border border-border/80 bg-panel p-3 shadow-panel sm:left-auto sm:right-0"
                                 id={`course-color-picker-${course.id}`}
                                 role="group"
                               >
@@ -618,6 +608,19 @@ export function CalendarPage() {
                                 </div>
                               </div>
                             ) : null}
+                          </div>
+                          <div className="flex min-h-11 min-w-0 flex-1 items-center gap-3 rounded-2xl px-1 py-1 text-sm font-medium text-text-muted">
+                            <input
+                              aria-label={courseLabel}
+                              checked={selectedCourseIds.has(course.id)}
+                              className="size-4 accent-accent"
+                              id={checkboxId}
+                              onChange={() => toggleCourse(course.id)}
+                              type="checkbox"
+                            />
+                            <label className="min-w-0 flex-1 cursor-pointer" htmlFor={checkboxId}>
+                              <span className="block truncate">{courseLabel}</span>
+                            </label>
                           </div>
                         </div>
                         {courseColorError ? (

@@ -211,6 +211,27 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   await expect(page.getByRole("button", { name: "List", exact: true })).toHaveAttribute("aria-pressed", "true")
   await expect(page.getByRole("button", { name: /Final project/i })).toBeVisible()
   await expect(page.getByRole("link", { name: /Midterm/i })).toBeVisible()
+  await expect
+    .poll(() => page.evaluate(() => ({
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    })))
+    .toEqual({ clientWidth: 375, scrollWidth: 375 })
+  await page.getByRole("button", { name: "Change color for CS 101" }).click()
+  await expect(page.getByRole("group", { name: "Choose a color for CS 101" })).toBeVisible()
+  const paletteBox = await page.getByRole("group", { name: "Choose a color for CS 101" }).boundingBox()
+  expect(paletteBox).not.toBeNull()
+  expect(paletteBox!.x).toBeGreaterThanOrEqual(0)
+  expect(paletteBox!.x + paletteBox!.width).toBeLessThanOrEqual(375)
+  expect(paletteBox!.y + paletteBox!.height).toBeLessThanOrEqual(812)
+  await expect
+    .poll(() => page.evaluate(() => ({
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    })))
+    .toEqual({ clientWidth: 375, scrollWidth: 375 })
+  await page.keyboard.press("Escape")
+  await expect(page.getByRole("group", { name: "Choose a color for CS 101" })).toBeHidden()
 
   await page.getByRole("navigation", { name: "Mobile navigation" }).getByRole("link", { name: "Review", exact: true }).click()
   await expect(page).toHaveURL(/\/review$/)

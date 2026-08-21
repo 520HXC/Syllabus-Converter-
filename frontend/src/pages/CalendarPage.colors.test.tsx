@@ -1,8 +1,8 @@
 import type { ReactNode } from "react"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
-import { render, screen, waitFor, within } from "@testing-library/react"
+import { act, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
-import { MemoryRouter, Route, Routes } from "react-router-dom"
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom"
 
 import type { Course, ExtractedEvent } from "../lib/types"
 import { CalendarPage } from "./CalendarPage"
@@ -131,12 +131,18 @@ function renderCalendarPage(initialEntry = "/calendar") {
     <MemoryRouter initialEntries={[initialEntry]}>
       <QueryClientProvider client={queryClient}>
         <Routes>
-          <Route path="/calendar" element={<CalendarPage />} />
-          <Route path="/review" element={<div>Review page</div>} />
+          <Route path="/calendar" element={<><LocationDisplay /><CalendarPage /></>} />
+          <Route path="/review" element={<LocationDisplay />} />
         </Routes>
       </QueryClientProvider>
     </MemoryRouter>,
   )
+}
+
+function LocationDisplay() {
+  const location = useLocation()
+
+  return <div aria-label="Current route">{`${location.pathname}${location.search}`}</div>
 }
 
 beforeEach(() => {
@@ -221,6 +227,10 @@ test("uses stored course colors in dark mode and shared type labels across filte
   await user.click(screen.getByRole("button", { name: "Month" }))
   await waitFor(() => expect(fullCalendarPropsSpy).toHaveBeenCalled())
   const monthProps = fullCalendarPropsSpy.mock.calls.at(-1)?.[0] as {
+    eventClick: (arg: {
+      event: { id: string }
+      jsEvent: { preventDefault: () => void }
+    }) => void
     eventContent: (arg: { event: { title: string; extendedProps: Record<string, unknown> } }) => ReactNode
     events: Array<{ id: string; backgroundColor: string; borderColor: string; extendedProps: Record<string, unknown> }>
   }
@@ -249,14 +259,41 @@ test("uses stored course colors in dark mode and shared type labels across filte
   })
 })
 
-test("opens and closes the course color palette without toggling the checkbox", async () => {
+test("routes month event clicks to the review deep link", async () => {
+  const user = userEvent.setup()
+  renderCalendarPage()
+
+  expect(await screen.findByRole("heading", { name: "Fall 2026" })).toBeInTheDocument()
+
+  await user.click(screen.getByRole("button", { name: "Month" }))
+  await waitFor(() => expect(fullCalendarPropsSpy).toHaveBeenCalled())
+  const monthProps = fullCalendarPropsSpy.mock.calls.at(-1)?.[0] as {
+    eventClick: (arg: {
+      event: { id: string }
+      jsEvent: { preventDefault: () => void }
+    }) => void
+  }
+
+  const preventDefault = vi.fn()
+  await act(async () => {
+    monthProps.eventClick({
+      event: { id: "event-2" },
+      jsEvent: { preventDefault },
+    })
+  })
+
+  expect(preventDefault).toHaveBeenCalledTimes(1)
+  expect(screen.getByLabelText("Current route")).toHaveTextContent("/review?eventId=event-2")
+})
+
+test("clicking the visible course color dot opens the palette without toggling the checkbox", async () => {
   const user = userEvent.setup()
   renderCalendarPage()
 
   const courseCheckbox = await screen.findByRole("checkbox", { name: /CS 101/i })
   expect(courseCheckbox).toBeChecked()
 
-  await user.click(screen.getByRole("button", { name: "Change color for CS 101" }))
+  await user.click(screen.getByTestId("course-color-button-course-1"))
   expect(courseCheckbox).toBeChecked()
 
   const colorPicker = screen.getByRole("group", { name: "Choose a color for CS 101" })
@@ -270,8 +307,8 @@ test("opens and closes the course color palette without toggling the checkbox", 
   await user.keyboard("{Escape}")
   expect(screen.queryByRole("group", { name: "Choose a color for CS 101" })).not.toBeInTheDocument()
 
-  await user.click(screen.getByRole("button", { name: "Change color for CS 101" }))
-  await user.click(screen.getByRole("button", { name: "Change color for MATH 201" }))
+  await user.click(screen.getByTestId("course-color-button-course-1"))
+  await user.click(screen.getByTestId("course-color-button-course-2"))
   expect(screen.queryByRole("group", { name: "Choose a color for CS 101" })).not.toBeInTheDocument()
   expect(screen.getByRole("group", { name: "Choose a color for MATH 201" })).toBeInTheDocument()
 
@@ -287,7 +324,7 @@ test("optimistically updates the current course visuals and persists the saved c
 
   expect(await screen.findByRole("heading", { name: "Fall 2026" })).toBeInTheDocument()
 
-  await user.click(screen.getByRole("button", { name: "Change color for CS 101" }))
+  await user.click(screen.getByTestId("course-color-button-course-1"))
   await user.click(within(screen.getByRole("group", { name: "Choose a color for CS 101" })).getByRole("button", { name: "Red" }))
 
   expect(updateCourseMock).toHaveBeenCalledWith("course-1", { color: "#DC2626" })
@@ -308,7 +345,7 @@ test("rolls back an optimistic color update and shows a course-level alert when 
 
   expect(await screen.findByRole("heading", { name: "Fall 2026" })).toBeInTheDocument()
 
-  await user.click(screen.getByRole("button", { name: "Change color for CS 101" }))
+  await user.click(screen.getByTestId("course-color-button-course-1"))
   await user.click(within(screen.getByRole("group", { name: "Choose a color for CS 101" })).getByRole("button", { name: "Red" }))
 
   expect(updateCourseMock).toHaveBeenCalledWith("course-1", { color: "#DC2626" })

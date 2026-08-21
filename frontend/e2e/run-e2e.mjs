@@ -7,9 +7,10 @@ import { fileURLToPath } from "node:url"
 const runRoot = await mkdtemp(join(tmpdir(), "syllabus-calendar-e2e-"))
 const frontendRoot = fileURLToPath(new URL("..", import.meta.url))
 const playwrightCli = join(frontendRoot, "node_modules", "@playwright", "test", "cli.js")
+const forwardedArgs = process.argv.slice(2)
 
 try {
-  const child = spawn(process.execPath, [playwrightCli, "test"], {
+  const child = spawn(process.execPath, [playwrightCli, "test", ...forwardedArgs], {
     cwd: frontendRoot,
     env: {
       ...process.env,
