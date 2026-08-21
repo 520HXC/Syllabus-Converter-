@@ -232,8 +232,18 @@ test("isolates review flow across documents and keeps the sticky footer clear at
     .toEqual({ clientWidth: 375, scrollWidth: 375 })
   await page.keyboard.press("Escape")
   await expect(page.getByRole("group", { name: "Choose a color for CS 101" })).toBeHidden()
-  await page.getByRole("button", { name: "Change color for MATH 201" }).click()
+  const mathColorButton = page.getByRole("button", { name: "Change color for MATH 201" })
+  const mathCourseRow = page.locator('[data-testid^="course-filter-row-"]').filter({ hasText: "MATH 201" })
+  const courseColorPatchResponse = page.waitForResponse((response) => (
+    response.request().method() === "PATCH" &&
+    /\/api\/courses\/[^/]+$/.test(response.url()) &&
+    response.status() === 200
+  ))
+  await mathColorButton.click()
   await page.getByRole("group", { name: "Choose a color for MATH 201" }).getByRole("button", { name: "Pink" }).click()
+  await courseColorPatchResponse
+  await expect(mathColorButton).toBeEnabled()
+  await expect(mathCourseRow.getByText("Saving color...")).toHaveCount(0)
   await expect(page.getByTestId(/course-filter-swatch-/).nth(1)).toHaveCSS("background-color", "rgb(219, 39, 119)")
   await expect(page.getByTestId(/calendar-course-rail-list-/).first()).toHaveCSS("background-color", "rgb(219, 39, 119)")
   await page.reload()
