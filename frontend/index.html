@@ -19,7 +19,7 @@
         } catch {}
         const theme = storedTheme === "light" || storedTheme === "dark" || storedTheme === "system"
           ? storedTheme
-          : "system"
+          : "dark"
         const prefersDark =
           typeof window.matchMedia === "function"
             ? window.matchMedia("(prefers-color-scheme: dark)").matches

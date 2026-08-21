@@ -73,6 +73,25 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+test("defaults to dark when no theme preference has been stored", async () => {
+  installMatchMedia(false)
+
+  render(
+    <ThemeProvider>
+      <ThemeProbe />
+    </ThemeProvider>,
+  )
+
+  expect(screen.getByLabelText("theme")).toHaveTextContent("dark")
+  expect(screen.getByLabelText("resolved-theme")).toHaveTextContent("dark")
+  expect(document.documentElement).toHaveClass("dark")
+  expect(document.documentElement).toHaveAttribute("data-theme", "dark")
+  expect(document.documentElement.style.colorScheme).toBe("dark")
+  await waitFor(() => {
+    expect(localStorage.getItem("syllabus-calendar-theme")).toBe("dark")
+  })
+})
+
 test("persists an explicit theme choice and applies the dark class to the document", async () => {
   installMatchMedia(false)
   const user = userEvent.setup()

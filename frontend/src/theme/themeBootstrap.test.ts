@@ -73,6 +73,16 @@ test("applies a stored dark theme before React mounts", () => {
   expect(document.querySelector('meta[name="theme-color"]')).toHaveAttribute("content", "#0a0a0a")
 })
 
+test("defaults to dark before React mounts when no preference has been stored", () => {
+  runBootstrap({ storedTheme: null, prefersDark: false })
+
+  expect(document.documentElement).toHaveClass("dark")
+  expect(document.documentElement).toHaveAttribute("data-theme", "dark")
+  expect(document.documentElement).toHaveAttribute("data-resolved-theme", "dark")
+  expect(document.documentElement.style.colorScheme).toBe("dark")
+  expect(document.querySelector('meta[name="theme-color"]')).toHaveAttribute("content", "#0a0a0a")
+})
+
 test("applies system dark mode before React mounts when the OS is dark", () => {
   runBootstrap({ storedTheme: "system", prefersDark: true })
 
@@ -83,7 +93,7 @@ test("applies system dark mode before React mounts when the OS is dark", () => {
   expect(document.querySelector('meta[name="theme-color"]')).toHaveAttribute("content", "#0a0a0a")
 })
 
-test("falls back to system light before React mounts when storage read fails and matchMedia is unavailable", () => {
+test("falls back to dark before React mounts when storage read fails and matchMedia is unavailable", () => {
   expect(() =>
     runBootstrap({
       hasMatchMedia: false,
@@ -93,9 +103,9 @@ test("falls back to system light before React mounts when storage read fails and
     }),
   ).not.toThrow()
 
-  expect(document.documentElement).not.toHaveClass("dark")
-  expect(document.documentElement).toHaveAttribute("data-theme", "system")
-  expect(document.documentElement).toHaveAttribute("data-resolved-theme", "light")
-  expect(document.documentElement.style.colorScheme).toBe("light")
-  expect(document.querySelector('meta[name="theme-color"]')).toHaveAttribute("content", "#f4f7fb")
+  expect(document.documentElement).toHaveClass("dark")
+  expect(document.documentElement).toHaveAttribute("data-theme", "dark")
+  expect(document.documentElement).toHaveAttribute("data-resolved-theme", "dark")
+  expect(document.documentElement.style.colorScheme).toBe("dark")
+  expect(document.querySelector('meta[name="theme-color"]')).toHaveAttribute("content", "#0a0a0a")
 })

@@ -2,18 +2,19 @@ export const themeStorageKey = "syllabus-calendar-theme"
 
 export type ThemePreference = "light" | "dark" | "system"
 export type ResolvedTheme = "light" | "dark"
+export const defaultThemePreference = "dark" satisfies ThemePreference
 
 export function isThemePreference(value: unknown): value is ThemePreference {
   return value === "light" || value === "dark" || value === "system"
 }
 
 export function readStoredTheme(storage: Pick<Storage, "getItem"> | null | undefined): ThemePreference {
-  if (!storage) return "system"
+  if (!storage) return defaultThemePreference
   try {
     const stored = storage.getItem(themeStorageKey)
-    return isThemePreference(stored) ? stored : "system"
+    return isThemePreference(stored) ? stored : defaultThemePreference
   } catch {
-    return "system"
+    return defaultThemePreference
   }
 }
 

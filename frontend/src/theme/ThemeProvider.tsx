@@ -9,6 +9,7 @@ import {
 
 import {
   applyThemePreference,
+  defaultThemePreference,
   getSystemThemeMatcher,
   readStoredTheme,
   resolveTheme,
@@ -24,8 +25,8 @@ type ThemeContextValue = {
 }
 
 const defaultThemeContext: ThemeContextValue = {
-  theme: "system",
-  resolvedTheme: "light",
+  theme: defaultThemePreference,
+  resolvedTheme: defaultThemePreference,
   setTheme: () => undefined,
 }
 
@@ -48,7 +49,7 @@ function syncMetaThemeColor(resolvedTheme: ResolvedTheme) {
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<ThemePreference>(() =>
-    typeof window === "undefined" ? "system" : readStoredTheme(window.localStorage),
+    typeof window === "undefined" ? defaultThemePreference : readStoredTheme(window.localStorage),
   )
   const [prefersDark, setPrefersDark] = useState(getInitialSystemPreference)
 
