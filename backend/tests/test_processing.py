@@ -1634,6 +1634,100 @@ def test_may_month_in_exact_recurrence_is_not_treated_as_ambiguous():
     )
 
 
+def test_materializes_missing_ambiguous_recurring_heading_for_review_without_false_positive():
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {
+            "page": 3,
+            "ocr": False,
+            "text": (
+                'Lab Exams (10%): Periodically, labs may start with a "lab exam". '
+                "Lab Policy: Labs may start late. "
+                "Exam Policy: Exam dates may change. "
+                "Academic dishonesty may include misrepresentation or deception."
+            ),
+        }
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert len(completed.events) == 1
+    event = completed.events[0]
+    assert event.title == "Lab Exams"
+    assert event.event_type == "exam"
+    assert event.event_date is None
+    assert event.source_page == 3
+    assert event.source_quote == 'Lab Exams (10%): Periodically, labs may start with a "lab exam".'
+    assert event.extraction_model == "gpt-5.6-luna"
+    assert event.derivation_summary == (
+        "Dates were not generated because the syllabus does not identify every occurrence."
+    )
+    _, ambiguous_indexes, _ = processing._normalize_ambiguous_recurring_content(completed, pages)
+    assert ambiguous_indexes == {0}
+    assert processing._event_type_for_title("Homework deadline") == "deadline"
+
+
+def test_materializes_missing_lab_makeup_deadline_for_review():
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {
+            "page": 2,
+            "ocr": False,
+            "text": (
+                "Make-Up Policy - Missed labs can be submitted until "
+                "11:59pm on the Sunday that follows\n"
+                "the lab. Labs can only be made up with an excused absence."
+            ),
+        }
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert len(completed.events) == 1
+    event = completed.events[0]
+    assert event.title == "Lab assignment make-up deadline"
+    assert event.event_type == "deadline"
+    assert event.event_date is None
+    assert event.end_time == time(23, 59)
+    assert event.source_page == 2
+    assert event.source_quote == (
+        "Make-Up Policy - Missed labs can be submitted until "
+        "11:59pm on the Sunday that follows the lab."
+    )
+    assert event.extraction_model == "gpt-5.6-luna"
+    assert event.derivation_summary == (
+        "Dates were not generated because the syllabus does not identify every occurrence."
+    )
+    normalized, ambiguous_indexes, _ = processing._normalize_ambiguous_recurring_content(
+        completed,
+        pages,
+    )
+    assert normalized.events[0].title == "Lab assignment make-up deadline"
+    assert ambiguous_indexes == {0}
+
+
 def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
     app_client, monkeypatch
 ):
@@ -2203,7 +2297,7 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
             "Quick Checks - 8AM the morning of the lecture. "
             "Exercise Sets - 8AM the morning after the lecture. "
             "Nearly every topic includes a quick check and exercise set. "
-            "Lab Exams are scheduled periodically. "
+            'Lab Exams (10%): Periodically, labs may start with a "lab exam". '
             "Lab assignment make-up deadline as scheduled by course staff. "
             "Lab assignment make-up deadline - 11:59PM the Sunday following the lab."
         )
@@ -2274,32 +2368,6 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
                 end_time=None,
                 is_all_day=True,
                 source_quote="Final exam as scheduled by Registrar",
-                source_page=1,
-                confidence="medium",
-                year_was_explicit=True,
-                uncertainty_reason=None,
-            ),
-            CandidateEvent(
-                title="Lab assignment make-up deadline",
-                event_type="deadline",
-                event_date=None,
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                source_quote="Lab assignment make-up deadline as scheduled by course staff",
-                source_page=1,
-                confidence="medium",
-                year_was_explicit=True,
-                uncertainty_reason=None,
-            ),
-            CandidateEvent(
-                title="Lab Exams",
-                event_type="exam",
-                event_date=None,
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                source_quote="Lab Exams are scheduled periodically",
                 source_page=1,
                 confidence="medium",
                 year_was_explicit=True,
@@ -2399,7 +2467,12 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
         ambiguous_titles = {
             event.title for event in review_events if "AMBIGUOUS_RECURRENCE" in event.warning_codes
         }
-        assert ambiguous_titles == {"Exercise Sets", "Quick Checks"}
+        assert ambiguous_titles == {
+            "Exercise Sets",
+            "Lab Exams",
+            "Lab assignment make-up deadline",
+            "Quick Checks",
+        }
 
     assert calls == ["gpt-5.6-luna"]
 

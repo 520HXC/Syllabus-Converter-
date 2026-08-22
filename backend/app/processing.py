@@ -55,6 +55,10 @@ AMBIGUOUS_MODAL_MAY_PATTERN = re.compile(
     r"\bmay\s+(?:occur|be scheduled|start|include|change)\b",
     re.IGNORECASE,
 )
+AMBIGUOUS_REVIEW_ITEM_PATTERN = re.compile(
+    r"\b(?:nearly every|usually|periodically|may\s+(?:occur|be scheduled|start))\b",
+    re.IGNORECASE,
+)
 RELATIVE_REVIEW_ONLY_PATTERN = re.compile(
     r"\b(?:the\s+)?morning\s+(?:of|after)\s+(?:the\s+)?lecture\b|"
     r"\bsunday\s+(?:that\s+)?follow(?:s|ing)\s+(?:the\s+)?lab\b",
@@ -70,6 +74,34 @@ DETERMINISTIC_RECURRING_RULE_PATTERN = re.compile(
 COURSE_STRUCTURE_PATTERN = re.compile(
     r"\b(?:course structure|this course includes|lecture sections?|lab section)\b",
     re.IGNORECASE,
+)
+AMBIGUOUS_RECURRING_HEADING_PATTERN = re.compile(
+    r"^(?P<title>[A-Za-z][A-Za-z0-9 &/\-]{1,100}?)"
+    r"(?:\s*\([^)]*\))?\s*:\s*(?P<body>.+)$",
+    re.IGNORECASE,
+)
+CALENDAR_ITEM_TITLE_PATTERN = re.compile(
+    r"\b(?:exams?|quizzes?|quick checks?|exercise sets?|assignments?|homework|projects?|"
+    r"presentations?|meetings?|deadlines?|readings?)\b",
+    re.IGNORECASE,
+)
+LAB_MAKEUP_POLICY_PATTERN = re.compile(
+    r"(?:\blab(?: assignment)? make-up deadline\s*[-:]\s*"
+    r"(?P<titled_time>\d{1,2}:\d{2}\s*(?:am|pm))\s+the sunday "
+    r"(?:that\s+)?follow(?:s|ing)\s+"
+    r"(?:the\s+)?lab\b)|"
+    r"(?:\bmissed labs can be submitted until\s+"
+    r"(?P<missed_time>\d{1,2}:\d{2}\s*(?:am|pm))\s+on the sunday that follow(?:s|ing)\s+"
+    r"(?:the\s+)?lab\b)",
+    re.IGNORECASE,
+)
+LAB_MAKEUP_TITLE_ALIASES = {
+    "lab assignment make up deadline",
+    "lab make up submission deadline",
+    "lab make up deadline",
+}
+REVIEW_ONLY_DERIVATION_SUMMARY = (
+    "Dates were not generated because the syllabus does not identify every occurrence."
 )
 GENERIC_ANCHOR_TYPES = {"lecture", "lab", "discussion", "class", "other"}
 
@@ -641,6 +673,23 @@ def _display_title(value: str) -> str:
     return " ".join(tokens).strip() or value.strip()
 
 
+def _event_type_for_title(title: str) -> str:
+    normalized = title.casefold()
+    if "exam" in normalized:
+        return "exam"
+    if "quiz" in normalized or "quick check" in normalized:
+        return "quiz"
+    if "deadline" in normalized:
+        return "deadline"
+    if any(term in normalized for term in ("assignment", "homework", "exercise set")):
+        return "assignment"
+    if "project" in normalized:
+        return "project"
+    if "reading" in normalized:
+        return "reading"
+    return "other"
+
+
 def _is_ambiguous_recurrence_text(value: str) -> bool:
     return bool(
         AMBIGUOUS_RECURRENCE_PATTERN.search(value)
@@ -678,6 +727,23 @@ def _page_sentences(page_text: str) -> list[str]:
         for segment in re.split(r"(?<=[.!?])\s+|\n+", page_text)
         if segment.strip()
     ]
+
+
+def _segment_with_continuation(segments: list[str], index: int, *, max_parts: int = 3) -> str:
+    parts = [segments[index].strip()]
+    cursor = index + 1
+    while cursor < len(segments) and len(parts) < max_parts:
+        previous = parts[-1]
+        if previous.endswith((".", "!", "?")):
+            break
+        next_segment = segments[cursor].strip()
+        if not next_segment or next_segment in {"○", "●"}:
+            break
+        if not re.match(r"^[a-z(]", next_segment):
+            break
+        parts.append(next_segment)
+        cursor += 1
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
 
 def _related_page_segments(
@@ -735,6 +801,10 @@ def _rule_requires_review_only(rule: RecurringRule, pages: list[dict]) -> bool:
 
 
 def _event_requires_review_only(event: CandidateEvent, pages: list[dict]) -> bool:
+    if event.derivation_summary == REVIEW_ONLY_DERIVATION_SUMMARY:
+        return True
+    if _is_ambiguous_recurrence_text(event.source_quote):
+        return True
     related_segments = _related_page_segments(
         title=event.title,
         source_page=event.source_page,
@@ -748,9 +818,7 @@ def _event_requires_review_only(event: CandidateEvent, pages: list[dict]) -> boo
         has_relative_phrase
         and (
             _is_ambiguous_recurrence_text(event.source_quote)
-            or any(
-            _is_ambiguous_recurrence_text(segment) for segment in related_segments
-            )
+            or any(_is_ambiguous_recurrence_text(segment) for segment in related_segments)
         )
     )
 
@@ -818,9 +886,7 @@ def _normalize_ambiguous_recurring_content(
     ambiguous_reason = (
         "The syllabus uses ambiguous recurrence wording, so exact dates were not generated."
     )
-    derivation_summary = (
-        "Dates were not generated because the syllabus does not identify every occurrence."
-    )
+    derivation_summary = REVIEW_ONLY_DERIVATION_SUMMARY
 
     def normalize_event(event: CandidateEvent) -> CandidateEvent:
         return event.model_copy(
@@ -954,6 +1020,94 @@ def _find_missing_recurring_rule_candidates(
             seen_titles.add(stable_title)
 
     return missing_candidates
+
+
+def _materialize_missing_ambiguous_review_events(
+    extraction: SyllabusExtraction,
+    pages: list[dict],
+    *,
+    extraction_model: str | None,
+) -> SyllabusExtraction:
+    events = [event.model_copy(deep=True) for event in extraction.events]
+    known_titles = {
+        _stable_title_key(item.title)
+        for item in [*extraction.events, *extraction.recurring_rules]
+    }
+    known_title_phrases = {
+        _normalize_phrase(item.title) for item in [*extraction.events, *extraction.recurring_rules]
+    }
+    derivation_summary = REVIEW_ONLY_DERIVATION_SUMMARY
+
+    for page in pages:
+        segments = _page_sentences(page["text"])
+        for index, _ in enumerate(segments):
+            segment = _segment_with_continuation(segments, index)
+            match = AMBIGUOUS_RECURRING_HEADING_PATTERN.match(segment)
+            if match is not None and AMBIGUOUS_REVIEW_ITEM_PATTERN.search(segment) is not None:
+                title = _display_title(match.group("title"))
+                stable_title = _stable_title_key(title)
+                if (
+                    stable_title
+                    and stable_title not in known_titles
+                    and CALENDAR_ITEM_TITLE_PATTERN.search(title) is not None
+                ):
+                    events.append(
+                        CandidateEvent(
+                            title=title,
+                            event_type=_event_type_for_title(title),
+                            event_date=None,
+                            start_time=None,
+                            end_time=None,
+                            is_all_day=True,
+                            source_quote=re.sub(r"\s+", " ", segment).strip(),
+                            source_page=page["page"],
+                            confidence=ConfidenceLevel.MEDIUM,
+                            year_was_explicit=True,
+                            uncertainty_reason=(
+                                "The syllabus describes a recurring item without "
+                                "identifying every date."
+                            ),
+                            extraction_model=extraction_model,
+                            derivation_summary=derivation_summary,
+                            review_status=ReviewStatus.NEEDS_REVIEW,
+                        )
+                    )
+                    known_titles.add(stable_title)
+                    known_title_phrases.add(_normalize_phrase(title))
+
+            if known_title_phrases & LAB_MAKEUP_TITLE_ALIASES:
+                continue
+            deadline_match = LAB_MAKEUP_POLICY_PATTERN.search(segment)
+            if deadline_match is None:
+                continue
+            deadline_time = (
+                deadline_match.group("titled_time") or deadline_match.group("missed_time")
+            )
+            events.append(
+                CandidateEvent(
+                    title="Lab assignment make-up deadline",
+                    event_type="deadline",
+                    event_date=None,
+                    start_time=None,
+                    end_time=date_parser.parse(deadline_time, fuzzy=True).time(),
+                    is_all_day=False,
+                    source_quote=re.sub(r"\s+", " ", segment).strip(),
+                    source_page=page["page"],
+                    confidence=ConfidenceLevel.MEDIUM,
+                    year_was_explicit=True,
+                    uncertainty_reason=(
+                        "The syllabus describes a recurring item without "
+                        "identifying every date."
+                    ),
+                    extraction_model=extraction_model,
+                    derivation_summary=derivation_summary,
+                    review_status=ReviewStatus.NEEDS_REVIEW,
+                )
+            )
+            known_titles.add(_stable_title_key("Lab assignment make-up deadline"))
+            known_title_phrases.update(LAB_MAKEUP_TITLE_ALIASES)
+
+    return extraction.model_copy(update={"events": events})
 
 
 def expand_recurring_rules(
@@ -1586,6 +1740,18 @@ def process_job(
                 job.primary_model = None
                 job.fallback_model = None
 
+            materialized_model = None
+            if settings.extraction_mode == "openai":
+                materialized_model = (
+                    settings.openai_fallback_model
+                    if fallback_reason_codes == ["PRIMARY_PARSE_FAILED"]
+                    else settings.openai_model
+                )
+            extraction = _materialize_missing_ambiguous_review_events(
+                extraction,
+                pages,
+                extraction_model=materialized_model,
+            )
             extraction = _filter_non_actionable_course_structure_items(extraction)
             extraction, ambiguous_event_indexes, ambiguous_warning_reason = (
                 _normalize_ambiguous_recurring_content(extraction, pages)
