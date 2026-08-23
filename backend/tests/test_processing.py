@@ -187,6 +187,546 @@ def test_validation_marks_an_undated_event_for_review():
     assert "The event does not have a confirmed date." in reason
 
 
+def test_validation_marks_explicit_numeric_date_with_wrong_weekday_as_conflict():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 27),
+        source_quote="27-Nov Wednesday No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": "27-Nov Wednesday No Lecture, Friday Schedule",
+            "ocr": False,
+        }
+    ]
+
+    warning_codes, reason = validate_candidate(
+        candidate,
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert "DATE_CONFLICT" in warning_codes
+    assert reason == processing.SYLLABUS_TYPO_WARNING
+
+
+def test_validation_uses_cited_page_context_when_source_quote_omits_date_and_weekday():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 27),
+        source_quote="No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": "27-Nov Wednesday No Lecture, Friday Schedule",
+            "ocr": False,
+        }
+    ]
+
+    warning_codes, reason = validate_candidate(
+        candidate,
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert "DATE_CONFLICT" in warning_codes
+    assert reason == processing.SYLLABUS_TYPO_WARNING
+
+
+def test_explicit_date_normalization_uses_nearest_preceding_context_row_when_quote_omits_date():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 26),
+        source_quote="No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "26-Nov Wednesday Review session.\n"
+                "27-Nov Thursday No Lecture, Friday Schedule.\n"
+                "28-Nov Friday Make-up session."
+            ),
+            "ocr": False,
+        }
+    ]
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+        pages=pages,
+    )
+    warning_codes, _ = validate_candidate(
+        normalized.events[0],
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 27)
+    assert "DATE_CONFLICT" not in warning_codes
+
+
+def test_explicit_date_normalization_uses_candidate_matching_occurrence_for_repeated_quote():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 27),
+        source_quote="No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "26-Nov Wednesday No Lecture, Friday Schedule.\n"
+                "Course policies and reminders.\n"
+                "27-Nov Thursday No Lecture, Friday Schedule."
+            ),
+            "ocr": False,
+        }
+    ]
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+        pages=pages,
+    )
+    warning_codes, _ = validate_candidate(
+        normalized.events[0],
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 27)
+    assert "DATE_CONFLICT" not in warning_codes
+
+
+def test_explicit_date_normalization_keeps_model_date_when_repeated_quote_matches_no_candidate_date(
+):
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 28),
+        source_quote="No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "26-Nov Wednesday No Lecture, Friday Schedule.\n"
+                "Course policies and reminders.\n"
+                "27-Nov Thursday No Lecture, Friday Schedule."
+            ),
+            "ocr": False,
+        }
+    ]
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+        pages=pages,
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 28)
+
+
+def test_explicit_date_normalization_allows_repeated_quote_when_all_occurrences_share_one_pair():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 26),
+        source_quote="No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "27-Nov Thursday No Lecture, Friday Schedule.\n"
+                "Repeated summary line.\n"
+                "27-Nov Thursday No Lecture, Friday Schedule."
+            ),
+            "ocr": False,
+        }
+    ]
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+        pages=pages,
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 27)
+
+
+@pytest.mark.parametrize(
+    ("source_quote", "event_date"),
+    [
+        ("27-Nov Thursday No Lecture, Friday Schedule", date(2025, 11, 27)),
+        ("Wednesday No Lecture, Friday Schedule", date(2025, 11, 27)),
+    ],
+)
+def test_validation_does_not_invent_weekday_conflicts_without_a_real_mismatch(
+    source_quote: str,
+    event_date: date,
+):
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=event_date,
+        source_quote=source_quote,
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    pages = [{"page": 4, "text": source_quote, "ocr": False}]
+
+    warning_codes, _ = validate_candidate(
+        candidate,
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert "DATE_CONFLICT" not in warning_codes
+
+
+def test_explicit_date_normalization_does_not_use_the_first_of_multiple_dates():
+    source_quote = (
+        "27-Nov Wednesday No Lecture, Friday Schedule. "
+        "28-Nov Friday Make-up session."
+    )
+    candidate = CandidateEvent(
+        title="Make-up session",
+        event_type="class",
+        event_date=date(2025, 11, 28),
+        source_quote=source_quote,
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+    warning_codes, _ = validate_candidate(
+        normalized.events[0],
+        [{"page": 4, "text": source_quote, "ocr": False}],
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 28)
+    assert "DATE_CONFLICT" not in warning_codes
+
+
+def test_explicit_date_normalization_prefers_source_quote_date_over_page_context():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 26),
+        source_quote="27-Nov Wednesday No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "26-Nov Wednesday Review session. "
+                "27-Nov Wednesday No Lecture, Friday Schedule. "
+                "28-Nov Friday Make-up session."
+            ),
+            "ocr": False,
+        }
+    ]
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+        pages=pages,
+    )
+    warning_codes, warning_reason = validate_candidate(
+        normalized.events[0],
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 27)
+    assert warning_codes == ["DATE_CONFLICT"]
+    assert (
+        warning_reason
+        == "Syllabus typo. The written date and weekday do not match. The numeric date was kept."
+    )
+
+
+def test_explicit_date_normalization_supports_pipe_separated_source_quote_dates():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 26),
+        source_quote="24 | 27-Nov | Wednesday | No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "22 | 25-Nov | Monday | Review session\n"
+                "23 | 26-Nov | Tuesday | Office hours\n"
+                "24 | 27-Nov | Wednesday | No Lecture, Friday Schedule\n"
+                "25 | 28-Nov | Friday | Make-up session"
+            ),
+            "ocr": False,
+        }
+    ]
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+        pages=pages,
+    )
+    warning_codes, warning_reason = validate_candidate(
+        normalized.events[0],
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 27)
+    assert warning_codes == ["DATE_CONFLICT"]
+    assert (
+        warning_reason
+        == "Syllabus typo. The written date and weekday do not match. The numeric date was kept."
+    )
+
+
+def test_explicit_date_normalization_keeps_model_date_when_multiple_quote_pairs_are_ambiguous():
+    source_quote = (
+        "27-Nov Wednesday No Lecture, Friday Schedule. "
+        "28-Nov Friday Make-up session."
+    )
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 26),
+        source_quote=source_quote,
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+
+    normalized = processing._normalize_explicit_source_event_dates(
+        extraction,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert normalized.events[0].event_date == date(2025, 11, 26)
+
+
+def test_validation_does_not_warn_when_explicit_quote_weekday_matches_real_date():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 27),
+        source_quote="27-Nov Thursday No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "26-Nov Wednesday Review session. "
+                "27-Nov Thursday No Lecture, Friday Schedule. "
+                "28-Nov Friday Make-up session."
+            ),
+            "ocr": False,
+        }
+    ]
+
+    warning_codes, _ = validate_candidate(
+        candidate,
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert "DATE_CONFLICT" not in warning_codes
+
+
+def test_validation_does_not_warn_when_pipe_separated_quote_weekday_matches_real_date():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 27),
+        source_quote="24 | 27-Nov | Thursday | No Lecture, Friday Schedule",
+        source_page=4,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    pages = [
+        {
+            "page": 4,
+            "text": (
+                "22 | 25-Nov | Tuesday | Review session\n"
+                "23 | 26-Nov | Wednesday | Office hours\n"
+                "24 | 27-Nov | Thursday | No Lecture, Friday Schedule\n"
+                "25 | 28-Nov | Friday | Make-up session"
+            ),
+            "ocr": False,
+        }
+    ]
+
+    warning_codes, _ = validate_candidate(
+        candidate,
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+    )
+
+    assert "DATE_CONFLICT" not in warning_codes
+
+
+def test_canonicalize_event_identity_normalizes_known_syllabus_items():
+    quick_checks = processing._canonicalize_event_identity(
+        CandidateEvent(
+            title="Quick Checks deadline",
+            event_type="deadline",
+            event_date=None,
+            source_quote="Quick Checks - 8AM the morning of the lecture",
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+        )
+    )
+    exercise_sets = processing._canonicalize_event_identity(
+        CandidateEvent(
+            title="Exercise Sets deadline",
+            event_type="deadline",
+            event_date=None,
+            source_quote="Exercise Sets - 8AM the morning after the lecture",
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+        )
+    )
+    no_lecture = processing._canonicalize_event_identity(
+        CandidateEvent(
+            title="No lecture / Friday schedule",
+            event_type="other",
+            event_date=date(2025, 11, 27),
+            source_quote="24 | 27-Nov | Wednesday | No Lecture, Friday Schedule",
+            source_page=4,
+            confidence="medium",
+            year_was_explicit=False,
+        )
+    )
+
+    assert (quick_checks.title, quick_checks.event_type) == ("Quick Checks", "quiz")
+    assert (exercise_sets.title, exercise_sets.event_type) == ("Exercise Sets", "assignment")
+    assert (no_lecture.title, no_lecture.event_type) == (
+        "No lecture / Friday schedule",
+        "class",
+    )
+
+
+def test_canonicalize_event_identity_does_not_use_unrelated_source_mentions():
+    candidate = CandidateEvent(
+        title="Final exam",
+        event_type="exam",
+        event_date=None,
+        source_quote="Unlike Quick Checks, the final exam is scheduled by the Registrar.",
+        source_page=1,
+        confidence="medium",
+        year_was_explicit=True,
+    )
+
+    normalized = processing._canonicalize_event_identity(candidate)
+
+    assert normalized.title == "Final exam"
+    assert normalized.event_type == "exam"
+
+
 def test_unknown_recurring_series_reference_becomes_a_standalone_event():
     candidate = CandidateEvent(
         title="Lab make-up submission deadline",
@@ -405,6 +945,163 @@ def test_process_job_repairs_only_retryable_luna_warnings_with_single_terra_call
         assert next(event for event in events if event.title == "Final exam").warning_codes == []
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+
+
+def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_typo(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    calls: list[str] = []
+    page_text = (
+        "26-Nov Wednesday Review session.\n"
+        "27-Nov Wednesday No Lecture, Friday Schedule.\n"
+        "28-Nov Friday Make-up session.\n"
+    ) * 4
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 20),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="fall2025.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/fall2025.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(make_pdf(page_text))
+
+    luna_output = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="No lecture - Friday schedule",
+                event_type="class",
+                event_date=date(2025, 11, 27),
+                source_quote="27-Nov Wednesday No Lecture, Friday Schedule",
+                source_page=1,
+                confidence="high",
+                year_was_explicit=False,
+            )
+        ],
+    )
+    terra_output = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="No lecture - Friday schedule",
+                event_type="class",
+                event_date=date(2025, 11, 26),
+                source_quote="27-Nov Wednesday No Lecture, Friday Schedule",
+                source_page=1,
+                confidence="high",
+                year_was_explicit=False,
+            )
+        ],
+    )
+
+    class FakeResponses:
+        def parse(self, **kwargs):
+            calls.append(kwargs["model"])
+            output = luna_output if kwargs["model"] == "gpt-5.6-luna" else terra_output
+            return SimpleNamespace(output_parsed=output)
+
+    class FakeOpenAI:
+        def __init__(self, api_key):
+            assert api_key == "test-key"
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
+        events = persisted.document.semester.events
+        assert len(events) == 1
+        event = events[0]
+        assert event.event_date == date(2025, 11, 27)
+        assert event.extraction_model == "gpt-5.6-luna"
+        assert event.warning_codes == ["DATE_CONFLICT"]
+        assert (
+            event.warning_reason
+            == "Syllabus typo. The written date and weekday do not match. "
+            "The numeric date was kept."
+        )
+        assert event.derivation_summary is None
+
+    assert calls == ["gpt-5.6-luna"]
+
+
+def test_cross_event_date_conflict_stays_retryable_when_source_has_weekday_typo():
+    candidate = CandidateEvent(
+        title="No lecture - Friday schedule",
+        event_type="class",
+        event_date=date(2025, 11, 27),
+        source_quote="27-Nov Wednesday No Lecture, Friday Schedule",
+        source_page=1,
+        confidence="high",
+        year_was_explicit=False,
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS-UY 1114",
+        course_name="Introduction to Programming and Problem Solving",
+        events=[candidate],
+    )
+    pages = [
+        {
+            "page": 1,
+            "text": "27-Nov Wednesday No Lecture, Friday Schedule",
+            "ocr": False,
+        }
+    ]
+
+    retryable_codes, flagged_events, _, _ = processing._preview_retryable_codes(
+        extraction,
+        pages,
+        semester_start=date(2025, 8, 25),
+        semester_end=date(2025, 12, 20),
+        known_dates_by_title={candidate.title.casefold(): {date(2025, 11, 26)}},
+    )
+
+    assert retryable_codes == ["DATE_CONFLICT"]
+    assert flagged_events == {0}
 
 
 def test_process_job_skips_terra_when_warnings_are_not_retryable(app_client, monkeypatch):
@@ -1678,6 +2375,135 @@ def test_materializes_missing_ambiguous_recurring_heading_for_review_without_fal
     assert processing._event_type_for_title("Homework deadline") == "deadline"
 
 
+def test_materialized_lab_exams_heading_collapses_existing_periodic_alias_on_same_page():
+    page_text = (
+        'Lab Exams (10%): Periodically, labs may start with a "lab exam". '
+        "Lab Policy: Labs may start late."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Periodic lab exams",
+                event_type="exam",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote='Periodically, labs may start with a "lab exam".',
+                source_page=3,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason="The syllabus does not identify every lab exam date.",
+                extraction_model="gpt-5.6-luna",
+                review_status=ReviewStatus.NEEDS_REVIEW,
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [{"page": 3, "ocr": False, "text": page_text}]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+    normalized, ambiguous_indexes, _ = processing._normalize_ambiguous_recurring_content(
+        completed,
+        pages,
+    )
+
+    assert [
+        (event.title, event.source_quote, event.review_status)
+        for event in normalized.events
+    ] == [
+        (
+            "Lab Exams",
+            'Lab Exams (10%): Periodically, labs may start with a "lab exam".',
+            ReviewStatus.NEEDS_REVIEW,
+        )
+    ]
+    assert ambiguous_indexes == {0}
+
+
+def test_materialized_lab_exams_heading_does_not_merge_distinct_page_or_dated_items():
+    page_text = (
+        'Lab Exams (10%): Periodically, labs may start with a "lab exam". '
+        "Lab Policy: Labs may start late."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Periodic lab exams",
+                event_type="exam",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote='Periodically, labs may start with a "lab exam".',
+                source_page=4,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason="The syllabus does not identify every lab exam date.",
+                extraction_model="gpt-5.6-luna",
+                review_status=ReviewStatus.NEEDS_REVIEW,
+            ),
+            CandidateEvent(
+                title="Lab Exams",
+                event_type="exam",
+                event_date=date(2025, 10, 14),
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Lab Exams October 14, 2025",
+                source_page=3,
+                confidence="high",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+                review_status=ReviewStatus.NEEDS_REVIEW,
+            ),
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [{"page": 3, "ocr": False, "text": page_text}]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+    normalized, ambiguous_indexes, _ = processing._normalize_ambiguous_recurring_content(
+        completed,
+        pages,
+    )
+
+    assert [
+        (event.title, event.source_page, event.event_date, event.source_quote)
+        for event in normalized.events
+    ] == [
+        (
+            "Lab Exams",
+            4,
+            None,
+            'Periodically, labs may start with a "lab exam".',
+        ),
+        (
+            "Lab Exams",
+            3,
+            date(2025, 10, 14),
+            "Lab Exams October 14, 2025",
+        ),
+    ]
+    assert ambiguous_indexes == {0}
+
+
 def test_materializes_missing_lab_makeup_deadline_for_review():
     extraction = SyllabusExtraction(
         course_code="CS 101",
@@ -1726,6 +2552,638 @@ def test_materializes_missing_lab_makeup_deadline_for_review():
     )
     assert normalized.events[0].title == "Lab assignment make-up deadline"
     assert ambiguous_indexes == {0}
+
+
+def test_materializer_reuses_luna_lab_makeup_submission_instead_of_duplicating_it():
+    source_quote = (
+        "Make-Up Policy - Missed labs can be submitted until "
+        "11:59pm on the Sunday that follows the lab."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab make-up submissions",
+                event_type="deadline",
+                event_date=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=source_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                uncertainty_reason=(
+                    "The syllabus does not identify the dates of individual labs."
+                ),
+                extraction_model="gpt-5.6-luna",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [{"page": 2, "ocr": False, "text": source_quote}]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert len(completed.events) == 1
+    event = completed.events[0]
+    assert event.title == "Lab assignment make-up deadline"
+    assert event.event_type == "deadline"
+    assert event.event_date is None
+    assert event.end_time == time(23, 59)
+    assert event.source_quote == source_quote
+    assert event.source_page == 2
+    assert event.extraction_model == "gpt-5.6-luna"
+    assert event.derivation_summary == (
+        "Dates were not generated because the syllabus does not identify every occurrence."
+    )
+
+
+def test_materializer_collapses_luna_and_terra_lab_makeup_aliases_from_same_source():
+    source_quote = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab assignment make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=source_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            ),
+            CandidateEvent(
+                title="Missed lab make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=source_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-terra",
+            ),
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [{"page": 2, "ocr": False, "text": source_quote}]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert len(completed.events) == 1
+    event = completed.events[0]
+    assert event.title == "Lab assignment make-up deadline"
+    assert event.source_quote == source_quote
+    assert event.source_page == 2
+    assert event.end_time == time(23, 59)
+    assert event.extraction_model == "gpt-5.6-luna"
+
+
+def test_materializer_does_not_collapse_lab_makeup_aliases_from_different_pages():
+    source_quote = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Missed lab make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=source_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {"page": 2, "ocr": False, "text": "Course logistics only."},
+        {"page": 3, "ocr": False, "text": source_quote},
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert [(event.title, event.source_page) for event in completed.events] == [
+        ("Missed lab make-up deadline", 2),
+        ("Lab assignment make-up deadline", 3),
+    ]
+
+
+def test_materializer_does_not_collapse_distinct_same_page_lab_policy_text():
+    existing_quote = (
+        "Lab make-up deadline: 11:59pm the Sunday following the lab after approved absences."
+    )
+    policy_source = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab make-up submissions",
+                event_type="deadline",
+                event_date=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=existing_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {
+            "page": 2,
+            "ocr": False,
+            "text": policy_source,
+        }
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert [(event.title, event.source_quote) for event in completed.events] == [
+        ("Lab make-up submissions", existing_quote),
+        ("Lab assignment make-up deadline", policy_source),
+    ]
+
+
+def test_materializer_collapses_short_alias_quote_into_same_page_lab_policy():
+    policy_source = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab make-up submissions",
+                event_type="deadline",
+                event_date=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Lab make-up submissions",
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {
+            "page": 2,
+            "ocr": False,
+            "text": f"Lab policies. {policy_source}",
+        }
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert len(completed.events) == 1
+    event = completed.events[0]
+    assert event.title == "Lab assignment make-up deadline"
+    assert event.end_time == time(23, 59)
+    assert event.event_date is None
+    assert event.source_quote == policy_source
+    assert event.source_page == 2
+
+
+def test_materializer_does_not_collapse_short_alias_when_page_has_multiple_lab_policies():
+    first_policy = "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    second_policy = "Lab assignment make-up deadline: 10:00pm the Sunday following the lab."
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab make-up submissions",
+                event_type="deadline",
+                event_date=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Lab make-up submissions",
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {
+            "page": 2,
+            "ocr": False,
+            "text": f"{first_policy} {second_policy}",
+        }
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert [(event.title, event.source_quote) for event in completed.events] == [
+        ("Lab make-up submissions", "Lab make-up submissions"),
+        ("Lab assignment make-up deadline", first_policy),
+        ("Lab assignment make-up deadline", second_policy),
+    ]
+
+
+def test_materializer_does_not_merge_an_unrelated_lab_deadline():
+    unrelated_source = "Lab project report deadline is November 14 at 11:59pm."
+    policy_source = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab project report deadline",
+                event_type="deadline",
+                event_date=date(2025, 11, 14),
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=unrelated_source,
+                source_page=2,
+                confidence="high",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {
+            "page": 2,
+            "ocr": False,
+            "text": f"{unrelated_source} {policy_source}",
+        }
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    assert [event.title for event in completed.events] == [
+        "Lab project report deadline",
+        "Lab assignment make-up deadline",
+    ]
+
+
+def test_materializer_and_ambiguous_normalization_collapses_dated_policy_alias():
+    policy_source = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab make-up submission deadline",
+                event_type="deadline",
+                event_date=date(2025, 9, 7),
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote="submitted until 11:59pm on the Sunday that follows the lab",
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-terra",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+    pages = [
+        {
+            "page": 2,
+            "ocr": False,
+            "text": f"Make-Up Policy. {policy_source}",
+        }
+    ]
+
+    completed = processing._materialize_missing_ambiguous_review_events(
+        extraction,
+        pages,
+        extraction_model="gpt-5.6-luna",
+    )
+    normalized, _, _ = processing._normalize_ambiguous_recurring_content(completed, pages)
+
+    assert [(event.title, event.event_date, event.source_quote) for event in normalized.events] == [
+        ("Lab assignment make-up deadline", None, policy_source),
+    ]
+
+
+def test_process_job_collapses_lab_makeup_aliases_without_merging_unrelated_lab_deadline(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    policy_source = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+    unrelated_source = "Lab project report deadline is November 14 at 11:59pm."
+    page_text = f"{unrelated_source}\n{policy_source}"
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 20),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="fall2025.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/fall2025.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(make_pdf(page_text))
+
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab assignment make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=policy_source,
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Missed lab make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=policy_source,
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Lab project report deadline",
+                event_type="deadline",
+                event_date=date(2025, 11, 14),
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=unrelated_source,
+                source_page=1,
+                confidence="high",
+                year_was_explicit=True,
+            ),
+        ],
+    )
+
+    monkeypatch.setattr(
+        "app.processing.extract_syllabus",
+        lambda pages, settings: extraction.model_copy(deep=True),
+    )
+
+    process_job(str(job_id), session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        events = sorted(
+            persisted.document.semester.events,
+            key=lambda item: (item.title, item.event_date or date.min),
+        )
+        assert [event.title for event in events] == [
+            "Lab assignment make-up deadline",
+            "Lab project report deadline",
+        ]
+        assert events[0].event_date is None
+        assert events[0].end_time == time(23, 59)
+        assert events[0].source_quote == policy_source
+        assert events[1].event_date == date(2025, 11, 14)
+        assert events[1].source_quote == unrelated_source
+
+
+def test_process_job_collapses_same_policy_terra_lab_alias_with_hallucinated_date(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+    policy_source = (
+        "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab."
+    )
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 20),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="fall2025.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/fall2025.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf(
+            f"Final exam as scheduled by Registrar. Make-Up Policy. {policy_source}"
+        )
+    )
+
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Final exam",
+                event_type="exam",
+                event_date=None,
+                is_all_day=True,
+                source_quote="Final exam as scheduled by Registrar",
+                source_page=1,
+                confidence="low",
+                year_was_explicit=True,
+                uncertainty_reason="The source wording is tentative.",
+                extraction_model="gpt-5.6-luna",
+            ),
+            CandidateEvent(
+                title="Lab assignment make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=policy_source,
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            ),
+            CandidateEvent(
+                title="Lab make-up submission deadline",
+                event_type="deadline",
+                event_date=date(2025, 9, 7),
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote="submitted until 11:59pm on the Sunday that follows the lab",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-terra",
+            ),
+        ],
+    )
+
+    monkeypatch.setattr(
+        "app.processing._extract_with_model_fallback",
+        lambda pages, settings, semester_start, semester_end, known_dates_by_title: (
+            extraction.model_copy(deep=True),
+            True,
+            ["LOW_CONFIDENCE"],
+            set(),
+        ),
+    )
+    monkeypatch.setattr(
+        "app.processing.extract_pdf_pages",
+        lambda content, min_text_characters=80, settings=None, on_ocr_start=None: (
+            [
+                {
+                    "page": 1,
+                    "text": (
+                        "Final exam as scheduled by Registrar. "
+                        f"Make-Up Policy. {policy_source}"
+                    ),
+                    "ocr": False,
+                }
+            ],
+            False,
+        ),
+    )
+    settings = app.state.settings.model_copy(
+        update={
+            "extraction_mode": "openai",
+            "openai_api_key": "test-key",
+            "openai_model": "gpt-5.6-luna",
+            "openai_fallback_model": "gpt-5.6-terra",
+        }
+    )
+
+    process_job(str(job_id), settings=settings, session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        lab_events = [
+            event
+            for event in persisted.document.semester.events
+            if "lab" in event.title.casefold()
+        ]
+        assert len(lab_events) == 1
+        event = lab_events[0]
+        assert event.title == "Lab assignment make-up deadline"
+        assert event.event_date is None
+        assert event.source_quote == policy_source
+        assert event.extraction_model == "gpt-5.6-luna"
 
 
 def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
@@ -2638,6 +4096,146 @@ def test_expand_recurring_rules_keeps_exact_class_rule_with_range_and_time():
     ]
 
 
+def test_expand_recurring_rules_skips_section_meeting_line_without_explicit_source_evidence():
+    section_rule = RecurringRule(
+        title="Weekly Lecture — Monday Sections",
+        event_type="class",
+        rule_kind="weekly_fixed",
+        weekday="monday",
+        start_time=time(11, 0),
+        end_time=time(12, 20),
+        is_all_day=False,
+        boundary_start=date(2025, 9, 8),
+        boundary_end=date(2025, 12, 8),
+        exclusion_dates=[],
+        source_quote="ALEC MW 11:00am - 12:20pm",
+        source_page=1,
+        confidence="high",
+        anchor_title=None,
+        offset_days=None,
+        uncertainty_reason=None,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    series, derived_events = expand_recurring_rules(
+        anchors=[],
+        rules=[section_rule],
+        semester_start=date(2025, 8, 24),
+        semester_end=date(2025, 12, 18),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert series == []
+    assert derived_events == []
+
+
+def test_expand_recurring_rules_skips_structural_lab_reference_without_explicit_source_evidence():
+    lab_rule = RecurringRule(
+        title="Weekly Labs",
+        event_type="class",
+        rule_kind="weekly_fixed",
+        weekday="wednesday",
+        start_time=None,
+        end_time=None,
+        is_all_day=True,
+        boundary_start=date(2025, 9, 3),
+        boundary_end=date(2025, 12, 10),
+        exclusion_dates=[],
+        source_quote="LB1 - LB8 See Albert",
+        source_page=2,
+        confidence="medium",
+        anchor_title=None,
+        offset_days=None,
+        uncertainty_reason=None,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    series, derived_events = expand_recurring_rules(
+        anchors=[],
+        rules=[lab_rule],
+        semester_start=date(2025, 8, 24),
+        semester_end=date(2025, 12, 18),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert series == []
+    assert derived_events == []
+
+
+def test_expand_recurring_rules_skips_section_meeting_line_with_weekly_language_but_no_range():
+    section_rule = RecurringRule(
+        title="Weekly Lecture — Monday Sections",
+        event_type="class",
+        rule_kind="weekly_fixed",
+        weekday="monday",
+        start_time=time(11, 0),
+        end_time=time(12, 20),
+        is_all_day=False,
+        boundary_start=date(2025, 9, 8),
+        boundary_end=date(2025, 12, 8),
+        exclusion_dates=[],
+        source_quote="ALEC MW 11:00am - 12:20pm every Monday",
+        source_page=1,
+        confidence="high",
+        anchor_title=None,
+        offset_days=None,
+        uncertainty_reason=None,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    series, derived_events = expand_recurring_rules(
+        anchors=[],
+        rules=[section_rule],
+        semester_start=date(2025, 8, 24),
+        semester_end=date(2025, 12, 18),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert series == []
+    assert derived_events == []
+
+
+def test_expand_recurring_rules_skips_section_meeting_line_with_range_but_no_weekly_language():
+    section_rule = RecurringRule(
+        title="Weekly Lecture — Monday Sections",
+        event_type="class",
+        rule_kind="weekly_fixed",
+        weekday="monday",
+        start_time=time(11, 0),
+        end_time=time(12, 20),
+        is_all_day=False,
+        boundary_start=date(2025, 9, 8),
+        boundary_end=date(2025, 12, 8),
+        exclusion_dates=[],
+        source_quote="ALEC MW 11:00am - 12:20pm from Sep 8, 2025 through Dec 8, 2025",
+        source_page=1,
+        confidence="high",
+        anchor_title=None,
+        offset_days=None,
+        uncertainty_reason=None,
+        extraction_model="gpt-5.6-luna",
+    )
+
+    series, derived_events = expand_recurring_rules(
+        anchors=[],
+        rules=[section_rule],
+        semester_start=date(2025, 8, 24),
+        semester_end=date(2025, 12, 18),
+        explicit_events=[],
+        extraction_model="gpt-5.6-luna",
+        max_occurrences=200,
+    )
+
+    assert series == []
+    assert derived_events == []
+
+
 def test_expand_recurring_rules_matches_generic_anchor_titles_across_sections():
     monday_section = ScheduleAnchor(
         title="ALEC lecture",
@@ -3138,6 +4736,728 @@ def test_local_extractor_builds_weekly_recurring_rule_from_clear_due_line():
     assert rule.boundary_start == date(2026, 9, 4)
     assert rule.boundary_end == date(2026, 12, 4)
     assert rule.exclusion_dates == [date(2026, 11, 27)]
+
+
+def test_filter_non_actionable_course_structure_items_drops_lab_assignment_description():
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab Assignments",
+                event_type="assignment",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Weekly lab assignments are conducted in a supervised setting.",
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Homework",
+                event_type="assignment",
+                event_date=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote="Homework is due every Friday from Sep 4, 2026 through Sep 18, 2026.",
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+
+    filtered = processing._filter_non_actionable_course_structure_items(extraction)
+
+    assert [event.title for event in filtered.events] == ["Homework"]
+
+
+def test_filter_non_actionable_course_structure_items_drops_section_meeting_events_and_rules():
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Weekly Lecture — DLEC",
+                event_type="class",
+                event_date=None,
+                start_time=time(17, 0),
+                end_time=time(18, 20),
+                is_all_day=False,
+                source_quote="DLEC MW 5:00pm - 6:20pm",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Lecture",
+                event_type="class",
+                event_date=None,
+                start_time=time(10, 0),
+                end_time=time(11, 15),
+                is_all_day=False,
+                source_quote=(
+                    "Lecture meets every Monday at 10:00 from Sep 7, 2026 through Sep 21, 2026"
+                ),
+                source_page=1,
+                confidence="high",
+                year_was_explicit=True,
+            ),
+        ],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Weekly Lecture — Wednesday Sections",
+                event_type="class",
+                rule_kind="weekly_fixed",
+                weekday="wednesday",
+                start_time=time(11, 0),
+                end_time=time(12, 20),
+                is_all_day=False,
+                boundary_start=date(2025, 9, 3),
+                boundary_end=date(2025, 12, 10),
+                exclusion_dates=[],
+                source_quote="BLEC MW 11:00am - 12:20pm",
+                source_page=1,
+                confidence="medium",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason=None,
+            ),
+            RecurringRule(
+                title="Lecture",
+                event_type="class",
+                rule_kind="weekly_fixed",
+                weekday="monday",
+                start_time=time(10, 0),
+                end_time=time(11, 15),
+                is_all_day=False,
+                boundary_start=date(2026, 9, 7),
+                boundary_end=date(2026, 9, 21),
+                exclusion_dates=[],
+                source_quote=(
+                    "Lecture meets every Monday at 10:00 from Sep 7, 2026 through Sep 21, 2026"
+                ),
+                source_page=1,
+                confidence="high",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason=None,
+            ),
+        ],
+    )
+
+    filtered = processing._filter_non_actionable_course_structure_items(extraction)
+
+    assert [event.title for event in filtered.events] == ["Lecture"]
+    assert [rule.title for rule in filtered.recurring_rules] == ["Lecture"]
+
+
+def test_filter_non_actionable_course_structure_items_drops_undated_section_description_event():
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Weekly lab section",
+                event_type="class",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=False,
+                source_quote="one mandatory weekly lab section",
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Exam 1",
+                event_type="exam",
+                event_date=date(2025, 10, 21),
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Exam Dates: 21 Oct 2025",
+                source_page=2,
+                confidence="high",
+                year_was_explicit=True,
+            ),
+        ],
+        schedule_anchors=[],
+        recurring_rules=[],
+    )
+
+    filtered = processing._filter_non_actionable_course_structure_items(extraction)
+
+    assert [event.title for event in filtered.events] == ["Exam 1"]
+
+
+def test_filter_non_actionable_course_structure_items_drops_section_rule_without_range():
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Weekly lab section",
+                event_type="class",
+                rule_kind="weekly_fixed",
+                weekday="wednesday",
+                start_time=None,
+                end_time=None,
+                is_all_day=False,
+                boundary_start=None,
+                boundary_end=None,
+                exclusion_dates=[],
+                source_quote="one mandatory weekly lab section",
+                source_page=2,
+                confidence="medium",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason="The syllabus does not identify every weekly lab date.",
+            ),
+            RecurringRule(
+                title="Lecture",
+                event_type="class",
+                rule_kind="weekly_fixed",
+                weekday="monday",
+                start_time=time(10, 0),
+                end_time=time(11, 15),
+                is_all_day=False,
+                boundary_start=date(2026, 9, 7),
+                boundary_end=date(2026, 9, 21),
+                exclusion_dates=[],
+                source_quote=(
+                    "Lecture meets every Monday at 10:00 from Sep 7, 2026 through Sep 21, 2026"
+                ),
+                source_page=1,
+                confidence="high",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason=None,
+            ),
+        ],
+    )
+
+    filtered = processing._filter_non_actionable_course_structure_items(extraction)
+
+    assert [rule.title for rule in filtered.recurring_rules] == ["Lecture"]
+
+
+def test_normalize_ambiguous_recurring_content_collapses_lab_alias_from_review_only_rule():
+    policy_quote = "until 11:59pm on the Sunday that follows the lab"
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab assignment make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=policy_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            )
+        ],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Lab Make-Up Submission Deadline",
+                event_type="deadline",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                boundary_start=None,
+                boundary_end=None,
+                exclusion_dates=[],
+                source_quote=policy_quote,
+                source_page=2,
+                confidence="medium",
+                anchor_title="Lab",
+                offset_days=0,
+                uncertainty_reason="The syllabus does not identify every lab date.",
+                extraction_model="gpt-5.6-terra",
+                expansion_mode="review_only",
+            )
+        ],
+    )
+    pages = [{"page": 2, "ocr": False, "text": policy_quote}]
+
+    normalized, _, _ = processing._normalize_ambiguous_recurring_content(extraction, pages)
+
+    assert [
+        (event.title, event.source_quote, event.source_page) for event in normalized.events
+    ] == [("Lab assignment make-up deadline", policy_quote, 2)]
+
+
+def test_normalize_ambiguous_recurring_content_remaps_indexes_after_lab_alias_collapse():
+    policy_quote = "until 11:59pm on the Sunday that follows the lab"
+    quick_checks_quote = "Quick Checks - 8AM the morning of the lecture"
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Lab assignment make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote=policy_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            ),
+            CandidateEvent(
+                title="Quick Checks",
+                event_type="quiz",
+                event_date=None,
+                start_time=time(8, 0),
+                end_time=None,
+                is_all_day=False,
+                source_quote=quick_checks_quote,
+                source_page=2,
+                confidence="medium",
+                year_was_explicit=True,
+                extraction_model="gpt-5.6-luna",
+            ),
+        ],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Lab Make-Up Submission Deadline",
+                event_type="deadline",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                boundary_start=None,
+                boundary_end=None,
+                exclusion_dates=[],
+                source_quote=policy_quote,
+                source_page=2,
+                confidence="medium",
+                anchor_title="Lab",
+                offset_days=0,
+                uncertainty_reason="The syllabus does not identify every lab date.",
+                extraction_model="gpt-5.6-terra",
+                expansion_mode="review_only",
+            )
+        ],
+    )
+    pages = [
+        {
+            "page": 2,
+            "ocr": False,
+            "text": (
+                f"{policy_quote}. Nearly every topic includes a quick check. "
+                f"{quick_checks_quote}."
+            ),
+        }
+    ]
+
+    normalized, ambiguous_indexes, _ = processing._normalize_ambiguous_recurring_content(
+        extraction,
+        pages,
+    )
+
+    assert [event.title for event in normalized.events] == [
+        "Lab assignment make-up deadline",
+        "Quick Checks",
+    ]
+    assert ambiguous_indexes == {0, 1}
+
+
+def test_collapse_lab_makeup_alias_events_canonicalizes_alias_first_time_fields():
+    events = [
+        CandidateEvent(
+            title="Lab Make-Up Submission Deadline",
+            event_type="deadline",
+            event_date=None,
+            start_time=time(23, 59),
+            end_time=None,
+            is_all_day=False,
+            source_quote="until 11:59pm on the Sunday that follows the lab",
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+        ),
+        CandidateEvent(
+            title="Lab assignment make-up deadline",
+            event_type="deadline",
+            event_date=None,
+            start_time=None,
+            end_time=None,
+            is_all_day=True,
+            source_quote="until 11:59pm on the Sunday that follows the lab",
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+        ),
+    ]
+
+    collapsed_events, collapsed_index_map = processing._collapse_lab_makeup_alias_events(events)
+
+    assert collapsed_index_map == {0: 0, 1: 0}
+    assert len(collapsed_events) == 1
+    event = collapsed_events[0]
+    assert event.title == "Lab assignment make-up deadline"
+    assert event.start_time is None
+    assert event.end_time == time(23, 59)
+    assert event.is_all_day is False
+
+
+def test_collapse_lab_makeup_alias_events_prefers_2359_from_longer_alias_quote():
+    events = [
+        CandidateEvent(
+            title="Lab Make-Up Submission Deadline",
+            event_type="deadline",
+            event_date=None,
+            start_time=None,
+            end_time=time(22, 0),
+            is_all_day=False,
+            source_quote="on the Sunday that follows the lab",
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+            extraction_model="gpt-5.6-luna",
+        ),
+        CandidateEvent(
+            title="Lab assignment make-up deadline",
+            event_type="deadline",
+            event_date=None,
+            start_time=None,
+            end_time=time(23, 59),
+            is_all_day=False,
+            source_quote=(
+                "Lab assignment make-up deadline until 11:59pm on the Sunday "
+                "that follows the lab"
+            ),
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+            extraction_model="gpt-5.6-terra",
+        ),
+    ]
+
+    collapsed_events, collapsed_index_map = processing._collapse_lab_makeup_alias_events(events)
+
+    assert collapsed_index_map == {0: 0, 1: 0}
+    assert len(collapsed_events) == 1
+    event = collapsed_events[0]
+    assert event.title == "Lab assignment make-up deadline"
+    assert event.start_time is None
+    assert event.end_time == time(23, 59)
+    assert event.source_quote == (
+        "Lab assignment make-up deadline until 11:59pm on the Sunday "
+        "that follows the lab"
+    )
+    assert event.extraction_model == "gpt-5.6-terra"
+
+
+def test_collapse_lab_makeup_alias_events_collapses_weekly_alias_title():
+    policy_quote = "until 11:59pm on the Sunday that follows the lab"
+    events = [
+        CandidateEvent(
+            title="Weekly lab assignment make-up deadline",
+            event_type="deadline",
+            event_date=None,
+            start_time=None,
+            end_time=None,
+            is_all_day=True,
+            source_quote=policy_quote,
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+        ),
+        CandidateEvent(
+            title="Lab assignment make-up deadline",
+            event_type="deadline",
+            event_date=None,
+            start_time=None,
+            end_time=time(23, 59),
+            is_all_day=False,
+            source_quote=policy_quote,
+            source_page=2,
+            confidence="medium",
+            year_was_explicit=True,
+        ),
+    ]
+
+    collapsed_events, collapsed_index_map = processing._collapse_lab_makeup_alias_events(events)
+
+    assert collapsed_index_map == {0: 0, 1: 0}
+    assert len(collapsed_events) == 1
+    event = collapsed_events[0]
+    assert event.title == "Lab assignment make-up deadline"
+    assert event.end_time == time(23, 59)
+
+
+def test_collapse_lab_exam_alias_events_prefers_quote_donor_model_provenance():
+    events = [
+        CandidateEvent(
+            title="Periodic lab exams",
+            event_type="exam",
+            event_date=None,
+            start_time=None,
+            end_time=None,
+            is_all_day=True,
+            source_quote='Periodically, labs may start with a "lab exam".',
+            source_page=3,
+            confidence="medium",
+            year_was_explicit=True,
+            extraction_model="gpt-5.6-luna",
+        ),
+        CandidateEvent(
+            title="Lab Exams",
+            event_type="exam",
+            event_date=None,
+            start_time=None,
+            end_time=None,
+            is_all_day=True,
+            source_quote='Lab Exams (10%): Periodically, labs may start with a "lab exam".',
+            source_page=3,
+            confidence="medium",
+            year_was_explicit=True,
+            extraction_model="gpt-5.6-terra",
+        ),
+    ]
+
+    collapsed_events, collapsed_index_map = processing._collapse_lab_exam_alias_events(events)
+
+    assert collapsed_index_map == {0: 0, 1: 0}
+    assert len(collapsed_events) == 1
+    event = collapsed_events[0]
+    assert event.title == "Lab Exams"
+    assert event.source_quote == 'Lab Exams (10%): Periodically, labs may start with a "lab exam".'
+    assert event.extraction_model == "gpt-5.6-terra"
+
+
+def test_process_job_attempt6_shapes_drop_section_items_and_keep_shifted_ambiguous_warning(
+    app_client, monkeypatch
+):
+    _, app = app_client
+    storage_path = Path(app.state.settings.local_storage_path)
+
+    with app.state.session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 20),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="attempt6.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/attempt6.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.QUEUED,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+        storage_key = document.storage_key
+
+    file_path = storage_path / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(
+        make_pdf(
+            "DLEC MW 5:00pm - 6:20pm. BLEC MW 11:00am - 12:20pm. "
+            "LB1 - LB8 See Albert. "
+            "Weekly lab assignments are conducted in a supervised setting. "
+            "Missed labs can be submitted until 11:59pm on the Sunday that follows the lab. "
+            "Nearly every topic includes a quick check. "
+            "Quick Checks - 8AM the morning of the lecture. "
+            "Final exam as scheduled by Registrar."
+        )
+    )
+
+    extraction = SyllabusExtraction(
+        course_code="CS 101",
+        course_name="Foundations of Computing",
+        instructor=None,
+        events=[
+            CandidateEvent(
+                title="Weekly Lecture — DLEC",
+                event_type="class",
+                event_date=None,
+                start_time=time(17, 0),
+                end_time=time(18, 20),
+                is_all_day=False,
+                source_quote="DLEC MW 5:00pm - 6:20pm",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Lab Assignments",
+                event_type="assignment",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Weekly lab assignments are conducted in a supervised setting.",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Lab assignment make-up deadline",
+                event_type="deadline",
+                event_date=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                source_quote="until 11:59pm on the Sunday that follows the lab",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Quick Checks",
+                event_type="quiz",
+                event_date=None,
+                start_time=time(8, 0),
+                end_time=None,
+                is_all_day=False,
+                source_quote="Quick Checks - 8AM the morning of the lecture",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+            CandidateEvent(
+                title="Final exam",
+                event_type="exam",
+                event_date=None,
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                source_quote="Final exam as scheduled by Registrar",
+                source_page=1,
+                confidence="medium",
+                year_was_explicit=True,
+            ),
+        ],
+        schedule_anchors=[],
+        recurring_rules=[
+            RecurringRule(
+                title="Weekly Lecture — Wednesday Sections",
+                event_type="class",
+                rule_kind="weekly_fixed",
+                weekday="wednesday",
+                start_time=time(11, 0),
+                end_time=time(12, 20),
+                is_all_day=False,
+                boundary_start=date(2025, 9, 3),
+                boundary_end=date(2025, 12, 10),
+                exclusion_dates=[],
+                source_quote="BLEC MW 11:00am - 12:20pm",
+                source_page=1,
+                confidence="medium",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason=None,
+            ),
+            RecurringRule(
+                title="Weekly Labs",
+                event_type="class",
+                rule_kind="weekly_fixed",
+                weekday="wednesday",
+                start_time=None,
+                end_time=None,
+                is_all_day=True,
+                boundary_start=date(2025, 9, 3),
+                boundary_end=date(2025, 12, 10),
+                exclusion_dates=[],
+                source_quote="LB1 - LB8 See Albert",
+                source_page=1,
+                confidence="medium",
+                anchor_title=None,
+                offset_days=None,
+                uncertainty_reason=None,
+            ),
+            RecurringRule(
+                title="Lab Make-Up Submission Deadline",
+                event_type="deadline",
+                rule_kind="relative_to_anchor",
+                weekday=None,
+                start_time=None,
+                end_time=time(23, 59),
+                is_all_day=False,
+                boundary_start=None,
+                boundary_end=None,
+                exclusion_dates=[],
+                source_quote="until 11:59pm on the Sunday that follows the lab",
+                source_page=1,
+                confidence="medium",
+                anchor_title="Lab",
+                offset_days=0,
+                uncertainty_reason="The syllabus does not identify every lab date.",
+                expansion_mode="review_only",
+            ),
+        ],
+    )
+
+    monkeypatch.setattr(
+        "app.processing.extract_syllabus",
+        lambda pages, settings: extraction.model_copy(deep=True),
+    )
+
+    process_job(str(job_id), session_factory=app.state.session_factory)
+
+    with app.state.session_factory() as session:
+        persisted = session.get(ProcessingJob, job_id)
+        assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
+        events = sorted(
+            persisted.document.semester.events,
+            key=lambda item: item.title,
+        )
+        assert [event.title for event in events] == [
+            "Final exam",
+            "Lab assignment make-up deadline",
+            "Quick Checks",
+        ]
+        quick_checks = next(event for event in events if event.title == "Quick Checks")
+        assert "AMBIGUOUS_RECURRENCE" in quick_checks.warning_codes
+        assert all("section" not in event.title.casefold() for event in events)
+        assert all("weekly lecture" not in event.title.casefold() for event in events)
+        assert all("weekly labs" not in event.title.casefold() for event in events)
+        series_count = session.query(RecurringEventSeries).filter(
+            RecurringEventSeries.document_id == persisted.document.id
+        ).count()
+        assert series_count == 0
 
 
 def test_safe_filename_removes_path_segments_and_header_characters():

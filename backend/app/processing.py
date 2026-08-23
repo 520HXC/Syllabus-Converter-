@@ -30,6 +30,10 @@ from .models import (
 from .storage import StorageService
 
 COURSE_COLORS = ["#0D9488", "#2563EB", "#7C3AED", "#DB2777", "#D97706", "#059669"]
+SYLLABUS_TYPO_WARNING = (
+    "Syllabus typo. The written date and weekday do not match. "
+    "The numeric date was kept."
+)
 RETRYABLE_TERRA_CODES = {
     "LOW_CONFIDENCE",
     "SOURCE_MISMATCH",
@@ -97,8 +101,18 @@ LAB_MAKEUP_POLICY_PATTERN = re.compile(
 )
 LAB_MAKEUP_TITLE_ALIASES = {
     "lab assignment make up deadline",
+    "lab make up submission",
     "lab make up submission deadline",
+    "lab make up submissions",
     "lab make up deadline",
+    "missed lab make up deadline",
+    "missed labs make up deadline",
+    "weekly lab assignment make up deadline",
+    "weekly lab make up deadline",
+}
+LAB_EXAM_TITLE_ALIASES = {
+    "lab exams",
+    "periodic lab exams",
 }
 REVIEW_ONLY_DERIVATION_SUMMARY = (
     "Dates were not generated because the syllabus does not identify every occurrence."
@@ -376,12 +390,43 @@ MONTH_PATTERN = (
     r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
     r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
 )
+WEEKDAY_PATTERN = (
+    r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+)
 ACTIONABLE_SCHEDULE_PATTERN = re.compile(
     rf"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b|"
     rf"\bfrom\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b|"
     rf"\bthrough\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b|"
     r"\bat\s+\d{1,2}(?::\d{2})?\b|"
     r"\bmeets every\b",
+    re.IGNORECASE,
+)
+SECTION_MEETING_TIME_PATTERN = re.compile(
+    r"^\s*[A-Z][A-Za-z0-9-]*\s+"
+    r"(?:M|T|Tu|W|Th|F|Sa|Su|MW|WF|TR|Mon|Tue|Wed|Thu|Fri|Sat|Sun|M/W|T/Th|Tu/Th)\b"
+    r".*?\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*[-–]\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
+    re.IGNORECASE,
+)
+STRUCTURAL_CLASS_REFERENCE_PATTERN = re.compile(
+    r"\bsee\s+albert\b|\bLB\d+\b",
+    re.IGNORECASE,
+)
+STRUCTURAL_SECTION_DESCRIPTION_PATTERN = re.compile(
+    r"\b(?:mandatory\s+)?weekly\s+(?:lab|lecture|discussion|class)\s+sections?\b|"
+    r"\b(?:lab|lecture|discussion|class)\s+sections?\b",
+    re.IGNORECASE,
+)
+EXPLICIT_WEEKLY_SOURCE_PATTERN = re.compile(
+    rf"\b(?:every|each)\s+(?:{WEEKDAY_PATTERN}|week)\b|\bweekly\b|\bmeets every\b",
+    re.IGNORECASE,
+)
+NON_ACTIONABLE_ASSIGNMENT_DESCRIPTION_PATTERN = re.compile(
+    r"\bconducted\s+in\s+a\s+supervised\s+setting\b",
+    re.IGNORECASE,
+)
+EXPLICIT_SOURCE_BOUNDARY_PATTERN = re.compile(
+    rf"\bfrom\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b.*\bthrough\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b|"
+    rf"\bbetween\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b.*\band\s+{MONTH_PATTERN}\s+\d{{1,2}},?\s+\d{{4}}\b",
     re.IGNORECASE,
 )
 EVENT_PATTERN = re.compile(
@@ -399,6 +444,25 @@ RECURRING_WEEKLY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DATE_TEXT_PATTERN = re.compile(rf"{MONTH_PATTERN}\s+\d{{1,2}},\s+\d{{4}}", re.IGNORECASE)
+SOURCE_DATE_WEEKDAY_PATTERNS = (
+    re.compile(
+        rf"\b(?P<day>\d{{1,2}})[\s|/-]+(?P<month>{MONTH_PATTERN})"
+        rf"(?:[\s,|/-]+(?P<year>\d{{4}}))?[\s,|/-]+"
+        rf"(?P<weekday>{WEEKDAY_PATTERN})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?P<month>{MONTH_PATTERN})[\s|/-]+(?P<day>\d{{1,2}})"
+        rf"(?:[\s,|/-]+(?P<year>\d{{4}}))?[\s,|/-]+"
+        rf"(?P<weekday>{WEEKDAY_PATTERN})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?P<weekday>{WEEKDAY_PATTERN})[\s,|/-]+(?P<day>\d{{1,2}})"
+        rf"[\s|/-]+(?P<month>{MONTH_PATTERN})(?:[\s,|/-]+(?P<year>\d{{4}}))?\b",
+        re.IGNORECASE,
+    ),
+)
 
 
 def extract_locally(pages: list[dict]) -> SyllabusExtraction:
@@ -690,6 +754,27 @@ def _event_type_for_title(title: str) -> str:
     return "other"
 
 
+def _canonicalize_event_identity(candidate: CandidateEvent) -> CandidateEvent:
+    normalized_title = _normalize_phrase(candidate.title)
+    title = _display_title(candidate.title)
+    event_type = candidate.event_type
+
+    if "quick check" in normalized_title:
+        title = "Quick Checks"
+        event_type = "quiz"
+    elif "exercise set" in normalized_title:
+        title = "Exercise Sets"
+        event_type = "assignment"
+    elif "no lecture" in normalized_title:
+        if "friday schedule" in normalized_title:
+            title = "No lecture / Friday schedule"
+            event_type = "class"
+
+    if title == candidate.title and event_type == candidate.event_type:
+        return candidate
+    return candidate.model_copy(update={"title": title, "event_type": event_type})
+
+
 def _is_ambiguous_recurrence_text(value: str) -> bool:
     return bool(
         AMBIGUOUS_RECURRENCE_PATTERN.search(value)
@@ -842,6 +927,38 @@ def _is_non_actionable_course_structure_event(event: CandidateEvent) -> bool:
     )
 
 
+def _is_non_actionable_section_meeting_quote(source_quote: str) -> bool:
+    has_meeting_shape = bool(
+        SECTION_MEETING_TIME_PATTERN.search(source_quote)
+        or STRUCTURAL_CLASS_REFERENCE_PATTERN.search(source_quote)
+        or STRUCTURAL_SECTION_DESCRIPTION_PATTERN.search(source_quote)
+    )
+    has_explicit_weekly = bool(EXPLICIT_WEEKLY_SOURCE_PATTERN.search(source_quote))
+    has_explicit_boundary = bool(EXPLICIT_SOURCE_BOUNDARY_PATTERN.search(source_quote))
+    return bool(
+        has_meeting_shape
+        and not (has_explicit_weekly and has_explicit_boundary)
+    )
+
+
+def _is_non_actionable_section_meeting_event(event: CandidateEvent) -> bool:
+    return bool(
+        event.event_type == "class"
+        and event.event_date is None
+        and _is_non_actionable_section_meeting_quote(event.source_quote)
+    )
+
+
+def _is_non_actionable_assignment_description_event(event: CandidateEvent) -> bool:
+    return bool(
+        event.event_type == "assignment"
+        and event.event_date is None
+        and event.start_time is None
+        and event.end_time is None
+        and NON_ACTIONABLE_ASSIGNMENT_DESCRIPTION_PATTERN.search(event.source_quote)
+    )
+
+
 def _is_non_actionable_course_structure_rule(rule: RecurringRule) -> bool:
     return bool(
         rule.event_type == "class"
@@ -866,14 +983,167 @@ def _filter_non_actionable_course_structure_items(
             event.model_copy(deep=True)
             for event in extraction.events
             if not _is_non_actionable_course_structure_event(event)
+            and not _is_non_actionable_section_meeting_event(event)
+            and not _is_non_actionable_assignment_description_event(event)
         ],
         schedule_anchors=[anchor.model_copy(deep=True) for anchor in extraction.schedule_anchors],
         recurring_rules=[
             rule.model_copy(deep=True)
             for rule in extraction.recurring_rules
             if not _is_non_actionable_course_structure_rule(rule)
+            and not _is_non_actionable_section_meeting_rule(rule)
         ],
     )
+
+
+def _is_non_actionable_section_meeting_rule(rule: RecurringRule) -> bool:
+    return bool(
+        rule.event_type == "class"
+        and rule.rule_kind == "weekly_fixed"
+        and _is_non_actionable_section_meeting_quote(rule.source_quote)
+    )
+
+
+def _collapse_lab_makeup_alias_events(
+    events: list[CandidateEvent],
+) -> tuple[list[CandidateEvent], dict[int, int]]:
+    def resolved_deadline_time(candidate: CandidateEvent) -> time | None:
+        return candidate.end_time or candidate.start_time
+
+    collapsed_events: list[CandidateEvent] = []
+    collapsed_index_map: dict[int, int] = {}
+    for original_index, event in enumerate(events):
+        normalized_title = _normalize_phrase(event.title)
+        if event.event_type != "deadline" or normalized_title not in LAB_MAKEUP_TITLE_ALIASES:
+            collapsed_events.append(event)
+            collapsed_index_map[original_index] = len(collapsed_events) - 1
+            continue
+        normalized_quote = _normalize_evidence(event.source_quote)
+        matching_index = next(
+            (
+                index
+                for index, existing in enumerate(collapsed_events)
+                if existing.event_type == "deadline"
+                and existing.source_page == event.source_page
+                and _normalize_phrase(existing.title) in LAB_MAKEUP_TITLE_ALIASES
+                and (
+                    _normalize_evidence(existing.source_quote)
+                    and normalized_quote
+                    and (
+                        _normalize_evidence(existing.source_quote) in normalized_quote
+                        or normalized_quote in _normalize_evidence(existing.source_quote)
+                    )
+                )
+            ),
+            None,
+        )
+        if matching_index is None:
+            collapsed_events.append(
+                event.model_copy(update={"title": "Lab assignment make-up deadline"})
+            )
+            collapsed_index_map[original_index] = len(collapsed_events) - 1
+            continue
+        existing = collapsed_events[matching_index]
+        existing_quote = _normalize_evidence(existing.source_quote)
+        use_new_quote = bool(normalized_quote and len(normalized_quote) > len(existing_quote))
+        existing_time = resolved_deadline_time(existing)
+        new_time = resolved_deadline_time(event)
+        if existing_time == time(23, 59) or new_time == time(23, 59):
+            end_time = time(23, 59)
+        elif use_new_quote and new_time is not None:
+            end_time = new_time
+        else:
+            end_time = existing_time or new_time
+        collapsed_events[matching_index] = existing.model_copy(
+            update={
+                "title": "Lab assignment make-up deadline",
+                "event_date": None,
+                "start_time": None,
+                "end_time": end_time,
+                "is_all_day": False if end_time else existing.is_all_day,
+                "source_quote": event.source_quote if use_new_quote else existing.source_quote,
+                "source_page": event.source_page if use_new_quote else existing.source_page,
+                "confidence": event.confidence if use_new_quote else existing.confidence,
+                "year_was_explicit": (
+                    event.year_was_explicit if use_new_quote else existing.year_was_explicit
+                ),
+                "uncertainty_reason": (
+                    event.uncertainty_reason if use_new_quote else existing.uncertainty_reason
+                ),
+                "extraction_model": (
+                    event.extraction_model if use_new_quote else existing.extraction_model
+                ),
+                "derivation_summary": existing.derivation_summary or event.derivation_summary,
+                "review_status": ReviewStatus.NEEDS_REVIEW,
+            }
+        )
+        collapsed_index_map[original_index] = matching_index
+    return collapsed_events, collapsed_index_map
+
+
+def _collapse_lab_exam_alias_events(
+    events: list[CandidateEvent],
+) -> tuple[list[CandidateEvent], dict[int, int]]:
+    collapsed_events: list[CandidateEvent] = []
+    collapsed_index_map: dict[int, int] = {}
+    for original_index, event in enumerate(events):
+        normalized_title = _normalize_phrase(event.title)
+        if (
+            event.event_type != "exam"
+            or event.event_date is not None
+            or normalized_title not in LAB_EXAM_TITLE_ALIASES
+        ):
+            collapsed_events.append(event)
+            collapsed_index_map[original_index] = len(collapsed_events) - 1
+            continue
+        normalized_quote = _normalize_evidence(event.source_quote)
+        matching_index = next(
+            (
+                index
+                for index, existing in enumerate(collapsed_events)
+                if existing.event_type == "exam"
+                and existing.event_date is None
+                and existing.source_page == event.source_page
+                and _normalize_phrase(existing.title) in LAB_EXAM_TITLE_ALIASES
+                and (
+                    _normalize_evidence(existing.source_quote)
+                    and normalized_quote
+                    and (
+                        _normalize_evidence(existing.source_quote) in normalized_quote
+                        or normalized_quote in _normalize_evidence(existing.source_quote)
+                    )
+                )
+            ),
+            None,
+        )
+        if matching_index is None:
+            collapsed_events.append(event.model_copy(update={"title": "Lab Exams"}))
+            collapsed_index_map[original_index] = len(collapsed_events) - 1
+            continue
+        existing = collapsed_events[matching_index]
+        existing_quote = _normalize_evidence(existing.source_quote)
+        use_new_quote = bool(normalized_quote and len(normalized_quote) > len(existing_quote))
+        collapsed_events[matching_index] = existing.model_copy(
+            update={
+                "title": "Lab Exams",
+                "source_quote": event.source_quote if use_new_quote else existing.source_quote,
+                "source_page": event.source_page if use_new_quote else existing.source_page,
+                "confidence": event.confidence if use_new_quote else existing.confidence,
+                "year_was_explicit": (
+                    event.year_was_explicit if use_new_quote else existing.year_was_explicit
+                ),
+                "uncertainty_reason": (
+                    event.uncertainty_reason if use_new_quote else existing.uncertainty_reason
+                ),
+                "extraction_model": (
+                    event.extraction_model if use_new_quote else existing.extraction_model
+                ),
+                "derivation_summary": existing.derivation_summary or event.derivation_summary,
+                "review_status": ReviewStatus.NEEDS_REVIEW,
+            }
+        )
+        collapsed_index_map[original_index] = matching_index
+    return collapsed_events, collapsed_index_map
 
 
 def _normalize_ambiguous_recurring_content(
@@ -947,6 +1217,18 @@ def _normalize_ambiguous_recurring_content(
         if event.event_date is None and _event_requires_review_only(event, pages):
             events[index] = normalize_event(event)
             normalized_event_indexes.add(index)
+    events, collapsed_exam_index_map = _collapse_lab_exam_alias_events(events)
+    normalized_event_indexes = {
+        collapsed_exam_index_map[index]
+        for index in normalized_event_indexes
+        if index in collapsed_exam_index_map
+    }
+    events, collapsed_index_map = _collapse_lab_makeup_alias_events(events)
+    normalized_event_indexes = {
+        collapsed_index_map[index]
+        for index in normalized_event_indexes
+        if index in collapsed_index_map
+    }
 
     return (
         SyllabusExtraction(
@@ -1022,6 +1304,39 @@ def _find_missing_recurring_rule_candidates(
     return missing_candidates
 
 
+def _matching_lab_makeup_event_indexes(
+    events: list[CandidateEvent],
+    source_page: int,
+    policy_segment: str,
+    page_policy_match_count: int,
+) -> list[int]:
+    normalized_segment = _normalize_evidence(policy_segment)
+    matching_indexes: list[int] = []
+    for index, event in enumerate(events):
+        if (
+            event.event_type != "deadline"
+            or event.source_page != source_page
+            or _normalize_phrase(event.title) not in LAB_MAKEUP_TITLE_ALIASES
+        ):
+            continue
+        normalized_quote = _normalize_evidence(event.source_quote)
+        normalized_quote_phrase = _normalize_phrase(event.source_quote)
+        quote_matches_segment = bool(
+            normalized_quote
+            and (
+                normalized_quote in normalized_segment
+                or normalized_segment in normalized_quote
+            )
+        )
+        alias_only_quote = (
+            normalized_quote_phrase in LAB_MAKEUP_TITLE_ALIASES
+            and page_policy_match_count == 1
+        )
+        if quote_matches_segment or alias_only_quote:
+            matching_indexes.append(index)
+    return matching_indexes
+
+
 def _materialize_missing_ambiguous_review_events(
     extraction: SyllabusExtraction,
     pages: list[dict],
@@ -1039,6 +1354,7 @@ def _materialize_missing_ambiguous_review_events(
     derivation_summary = REVIEW_ONLY_DERIVATION_SUMMARY
 
     for page in pages:
+        page_policy_match_count = len(list(LAB_MAKEUP_POLICY_PATTERN.finditer(page["text"])))
         segments = _page_sentences(page["text"])
         for index, _ in enumerate(segments):
             segment = _segment_with_continuation(segments, index)
@@ -1075,23 +1391,87 @@ def _materialize_missing_ambiguous_review_events(
                     known_titles.add(stable_title)
                     known_title_phrases.add(_normalize_phrase(title))
 
-            if known_title_phrases & LAB_MAKEUP_TITLE_ALIASES:
-                continue
             deadline_match = LAB_MAKEUP_POLICY_PATTERN.search(segment)
             if deadline_match is None:
                 continue
             deadline_time = (
                 deadline_match.group("titled_time") or deadline_match.group("missed_time")
             )
+            normalized_policy_segment = re.sub(r"\s+", " ", segment).strip()
+            parsed_deadline_time = date_parser.parse(deadline_time, fuzzy=True).time()
+            existing_indexes = _matching_lab_makeup_event_indexes(
+                events,
+                page["page"],
+                segment,
+                page_policy_match_count,
+            )
+            if existing_indexes:
+                canonical_title = _normalize_phrase("Lab assignment make-up deadline")
+                survivor_index = next(
+                    (
+                        index
+                        for index in existing_indexes
+                        if _normalize_phrase(events[index].title) == canonical_title
+                    ),
+                    existing_indexes[0],
+                )
+                existing = events[survivor_index]
+                existing_title_is_alias = _normalize_phrase(existing.title) != canonical_title
+                normalized_existing_quote = _normalize_evidence(existing.source_quote)
+                normalized_existing_phrase = _normalize_phrase(existing.source_quote)
+                normalized_segment = _normalize_evidence(segment)
+                alias_only_quote = (
+                    normalized_existing_phrase in LAB_MAKEUP_TITLE_ALIASES
+                    and not (
+                        normalized_existing_quote
+                        and (
+                            normalized_existing_quote in normalized_segment
+                            or normalized_segment in normalized_existing_quote
+                        )
+                    )
+                )
+                canonical_event = existing.model_copy(
+                    update={
+                        "title": "Lab assignment make-up deadline",
+                        "event_type": "deadline",
+                        "event_date": None,
+                        "end_time": existing.end_time or parsed_deadline_time,
+                        "is_all_day": False,
+                        "source_quote": normalized_policy_segment
+                        if existing_title_is_alias or alias_only_quote
+                        else existing.source_quote,
+                        "source_page": page["page"]
+                        if existing_title_is_alias or alias_only_quote
+                        else existing.source_page,
+                        "uncertainty_reason": existing.uncertainty_reason
+                        or (
+                            "The syllabus describes a recurring item without "
+                            "identifying every date."
+                        ),
+                        "derivation_summary": derivation_summary,
+                        "review_status": ReviewStatus.NEEDS_REVIEW,
+                    }
+                )
+                duplicate_indexes = set(existing_indexes)
+                events = [
+                    canonical_event
+                    if index == survivor_index
+                    else event
+                    for index, event in enumerate(events)
+                    if index == survivor_index or index not in duplicate_indexes
+                ]
+                known_titles.add(_stable_title_key("Lab assignment make-up deadline"))
+                known_title_phrases.update(LAB_MAKEUP_TITLE_ALIASES)
+                continue
             events.append(
                 CandidateEvent(
                     title="Lab assignment make-up deadline",
                     event_type="deadline",
                     event_date=None,
                     start_time=None,
-                    end_time=date_parser.parse(deadline_time, fuzzy=True).time(),
+                    end_time=parsed_deadline_time,
                     is_all_day=False,
-                    source_quote=re.sub(r"\s+", " ", segment).strip(),
+                    source_quote=normalized_policy_segment,
                     source_page=page["page"],
                     confidence=ConfidenceLevel.MEDIUM,
                     year_was_explicit=True,
@@ -1130,6 +1510,8 @@ def expand_recurring_rules(
 
     for rule in rules:
         if rule.expansion_mode == "review_only":
+            continue
+        if _is_non_actionable_section_meeting_rule(rule):
             continue
         range_start = max(semester_start, rule.boundary_start or semester_start)
         range_end = min(semester_end, rule.boundary_end or semester_end)
@@ -1263,13 +1645,26 @@ def _preview_retryable_codes(
     flagged_reasons: dict[str, list[str]] = {"events": [], "rules": []}
     for index, candidate in enumerate(extraction.events):
         warning_codes, _ = validate_candidate(candidate, pages, semester_start, semester_end)
-        if candidate.event_date is not None and detect_date_conflict(
+        source_weekday_typo = _is_source_weekday_typo(
+            candidate,
+            semester_start,
+            semester_end,
+            pages,
+        )
+        cross_event_conflict = candidate.event_date is not None and detect_date_conflict(
             candidate.title,
             candidate.event_date,
             known_dates_by_title,
-        ):
-            warning_codes = [*warning_codes, "DATE_CONFLICT"]
-        matched_codes = [code for code in warning_codes if code in RETRYABLE_TERRA_CODES]
+        )
+        matched_codes = [
+            code
+            for code in warning_codes
+            if code in RETRYABLE_TERRA_CODES
+            and not (code == "DATE_CONFLICT" and source_weekday_typo)
+        ]
+        if cross_event_conflict:
+            matched_codes.append("DATE_CONFLICT")
+        matched_codes = _ordered_retryable_codes(matched_codes)
         if matched_codes:
             flagged_event_indexes.add(index)
             retryable_codes.extend(matched_codes)
@@ -1448,9 +1843,21 @@ def _extract_with_model_fallback(
     try:
         primary = extract_with_openai(pages, settings, model=settings.openai_model)
         _apply_extraction_model(primary, settings.openai_model)
+        primary = _normalize_explicit_source_event_dates(
+            primary,
+            semester_start,
+            semester_end,
+            pages,
+        )
     except StructuredExtractionError:
         fallback = extract_with_openai(pages, settings, model=settings.openai_fallback_model)
         _apply_extraction_model(fallback, settings.openai_fallback_model)
+        fallback = _normalize_explicit_source_event_dates(
+            fallback,
+            semester_start,
+            semester_end,
+            pages,
+        )
         return fallback, True, ["PRIMARY_PARSE_FAILED"], set()
 
     (
@@ -1484,6 +1891,12 @@ def _extract_with_model_fallback(
         )
         _apply_extraction_model(repair, settings.openai_fallback_model)
         merged = _merge_extractions(primary, repair, flagged_event_indexes, flagged_rule_indexes)
+        merged = _normalize_explicit_source_event_dates(
+            merged,
+            semester_start,
+            semester_end,
+            pages,
+        )
         unresolved_missing_candidates = _find_missing_recurring_rule_candidates(merged, pages)
         unresolved_anchor_rules = _find_unresolved_exact_anchor_rules(merged, pages)
         if not unresolved_missing_candidates and not unresolved_anchor_rules:
@@ -1622,6 +2035,206 @@ def detect_date_conflict(
     return bool(existing_dates and event_date not in existing_dates)
 
 
+def _extract_source_date_weekday_matches(
+    source_text: str,
+    semester_start: date,
+    semester_end: date,
+) -> list[tuple[date, str, int, int]]:
+    pairs_by_key: dict[tuple[date, str], tuple[date, str, int, int]] = {}
+    for pattern in SOURCE_DATE_WEEKDAY_PATTERNS:
+        for match in pattern.finditer(source_text):
+            explicit_year = match.groupdict().get("year")
+            years = (
+                [int(explicit_year)]
+                if explicit_year
+                else list(range(semester_start.year, semester_end.year + 1))
+            )
+            matching_dates: list[date] = []
+            for year in years:
+                try:
+                    parsed_date = date_parser.parse(
+                        f"{match.group('day')} {match.group('month')} {year}",
+                        dayfirst=True,
+                        fuzzy=False,
+                    ).date()
+                except (OverflowError, ValueError):
+                    continue
+                if semester_start <= parsed_date <= semester_end:
+                    matching_dates.append(parsed_date)
+            matching_dates = list(dict.fromkeys(matching_dates))
+            if len(matching_dates) != 1:
+                continue
+            pair = (matching_dates[0], match.group("weekday").capitalize())
+            pairs_by_key.setdefault(pair, (*pair, match.start(), match.end()))
+    return sorted(pairs_by_key.values(), key=lambda item: item[2])
+
+
+def _find_whitespace_tolerant_quote_matches(
+    source_quote: str,
+    source_text: str,
+) -> list[tuple[int, int]]:
+    quote_parts = [re.escape(part) for part in re.split(r"\s+", source_quote.strip()) if part]
+    if not quote_parts:
+        return []
+    return [
+        (match.start(), match.end())
+        for match in re.finditer(r"\s+".join(quote_parts), source_text, re.IGNORECASE)
+    ]
+
+
+def _nearest_preceding_quote_pair(
+    source_text: str,
+    quote_start: int,
+    semester_start: date,
+    semester_end: date,
+) -> tuple[date, str] | None:
+    context_start = max(0, quote_start - 120)
+    preceding_context = source_text[context_start:quote_start]
+    context_matches = _extract_source_date_weekday_matches(
+        preceding_context,
+        semester_start,
+        semester_end,
+    )
+    if not context_matches:
+        return None
+    source_date, source_weekday, _, _ = context_matches[-1]
+    return source_date, source_weekday
+
+
+def _source_numeric_date_and_weekday(
+    candidate: CandidateEvent,
+    semester_start: date,
+    semester_end: date,
+    pages: list[dict] | None = None,
+) -> tuple[date, str] | None:
+    quote_matches = _extract_source_date_weekday_matches(
+        candidate.source_quote,
+        semester_start,
+        semester_end,
+    )
+    quote_pairs = [
+        (source_date, source_weekday)
+        for source_date, source_weekday, _, _ in quote_matches
+    ]
+    if len(quote_pairs) == 1:
+        return quote_pairs[0]
+    if len(quote_pairs) > 1 and candidate.event_date is not None:
+        matching_candidate_pairs = [
+            source_pair for source_pair in quote_pairs if source_pair[0] == candidate.event_date
+        ]
+        if len(matching_candidate_pairs) == 1:
+            return matching_candidate_pairs[0]
+        return None
+    if quote_pairs:
+        return None
+    if not pages:
+        return None
+    source_page = next(
+        (page for page in pages if page["page"] == candidate.source_page),
+        None,
+    )
+    if source_page is None:
+        return None
+    quote_matches = _find_whitespace_tolerant_quote_matches(
+        candidate.source_quote,
+        source_page["text"],
+    )
+    if not quote_matches:
+        return None
+    occurrence_pairs = [
+        source_pair
+        for source_pair in [
+            _nearest_preceding_quote_pair(
+                source_page["text"],
+                quote_start,
+                semester_start,
+                semester_end,
+            )
+            for quote_start, _ in quote_matches
+        ]
+        if source_pair is not None
+    ]
+    occurrence_pairs = list(dict.fromkeys(occurrence_pairs))
+    if not occurrence_pairs:
+        return None
+    if len(occurrence_pairs) == 1:
+        return occurrence_pairs[0]
+    if candidate.event_date is None:
+        return None
+    matching_candidate_pairs = [
+        source_pair for source_pair in occurrence_pairs if source_pair[0] == candidate.event_date
+    ]
+    if len(matching_candidate_pairs) == 1:
+        return matching_candidate_pairs[0]
+    return None
+
+
+def _is_source_weekday_typo(
+    candidate: CandidateEvent,
+    semester_start: date,
+    semester_end: date,
+    pages: list[dict] | None = None,
+) -> bool:
+    source_details = _source_numeric_date_and_weekday(
+        candidate,
+        semester_start,
+        semester_end,
+        pages,
+    )
+    if source_details is None:
+        return False
+    source_date, source_weekday = source_details
+    return source_weekday.casefold() != source_date.strftime("%A").casefold()
+
+
+def source_quote_has_weekday_typo(
+    source_quote: str,
+    event_date: date | None,
+    semester_start: date,
+    semester_end: date,
+) -> bool:
+    matches = _extract_source_date_weekday_matches(
+        source_quote,
+        semester_start,
+        semester_end,
+    )
+    if event_date is not None:
+        matches = [match for match in matches if match[0] == event_date]
+    pairs = {(source_date, weekday) for source_date, weekday, _, _ in matches}
+    if len(pairs) != 1:
+        return False
+    source_date, source_weekday = next(iter(pairs))
+    return source_weekday.casefold() != source_date.strftime("%A").casefold()
+
+
+def _normalize_explicit_source_event_dates(
+    extraction: SyllabusExtraction,
+    semester_start: date,
+    semester_end: date,
+    pages: list[dict] | None = None,
+) -> SyllabusExtraction:
+    normalized_events: list[CandidateEvent] = []
+    for candidate in extraction.events:
+        source_details = _source_numeric_date_and_weekday(
+            candidate,
+            semester_start,
+            semester_end,
+            pages,
+        )
+        if source_details is None:
+            normalized_events.append(candidate)
+            continue
+        source_date, source_weekday = source_details
+        update: dict[str, object] = {}
+        if candidate.event_date != source_date:
+            update["event_date"] = source_date
+        if source_weekday.casefold() != source_date.strftime("%A").casefold():
+            update["uncertainty_reason"] = None
+            update["derivation_summary"] = None
+        normalized_events.append(candidate.model_copy(update=update) if update else candidate)
+    return extraction.model_copy(update={"events": normalized_events})
+
+
 def validate_candidate(
     candidate: CandidateEvent,
     pages: list[dict],
@@ -1636,7 +2249,21 @@ def validate_candidate(
     elif not semester_start <= candidate.event_date <= semester_end:
         codes.append("OUTSIDE_SEMESTER")
         reasons.append("The extracted date is outside the semester range.")
-    if not candidate.year_was_explicit:
+    source_details = _source_numeric_date_and_weekday(
+        candidate,
+        semester_start,
+        semester_end,
+        pages,
+    )
+    source_weekday_typo = False
+    if source_details is not None:
+        source_date, source_weekday = source_details
+        actual_weekday = source_date.strftime("%A")
+        if source_weekday.casefold() != actual_weekday.casefold():
+            source_weekday_typo = True
+            codes.append("DATE_CONFLICT")
+            reasons.append(SYLLABUS_TYPO_WARNING)
+    if not candidate.year_was_explicit and not source_weekday_typo:
         codes.append("YEAR_NOT_EXPLICIT")
         reasons.append("The source does not explicitly state a year.")
 
@@ -1756,6 +2383,12 @@ def process_job(
             extraction, ambiguous_event_indexes, ambiguous_warning_reason = (
                 _normalize_ambiguous_recurring_content(extraction, pages)
             )
+            extraction = _normalize_explicit_source_event_dates(
+                extraction,
+                job.document.semester.start_date,
+                job.document.semester.end_date,
+                pages,
+            )
             job.fallback_used = fallback_used
             job.fallback_reason_codes = fallback_reason_codes
             _update_job(session, job, JobStatus.VALIDATING, "Checking dates and source evidence")
@@ -1844,6 +2477,7 @@ def process_job(
                 (None, candidate, False) for candidate in derived_candidates
             ]
             for candidate_index, candidate, is_primary_event in persisted_candidates:
+                candidate = _canonicalize_event_identity(candidate)
                 recurring_series_id = resolve_recurring_series_id(candidate, series_map.keys())
                 if candidate.recurring_series_id != recurring_series_id:
                     candidate = candidate.model_copy(
