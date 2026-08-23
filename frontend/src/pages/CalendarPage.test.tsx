@@ -3,7 +3,7 @@ import { render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom"
 
-import type { ExtractedEvent } from "../lib/types"
+import type { ExtractedEvent, ReviewPayload } from "../lib/types"
 import { CalendarPage, getCurrentWeekRangeForTimezone } from "./CalendarPage"
 
 function getReferenceNow() {
@@ -53,10 +53,35 @@ function getDateInCurrentWeek(daysFromMonday: number) {
   return date
 }
 
+function createReviewEvent(overrides: Partial<ExtractedEvent>): ExtractedEvent {
+  return {
+    id: "review-event",
+    semester_id: "semester-1",
+    course_id: "course-1",
+    document_id: "document-1",
+    title: "Review event",
+    event_type: "exam",
+    event_date: null,
+    start_time: null,
+    end_time: null,
+    timezone: "America/New_York",
+    is_all_day: true,
+    source_quote: "Review source quote",
+    source_page: 1,
+    confidence: "medium",
+    warning_codes: [],
+    warning_reason: null,
+    review_status: "pending",
+    recurring_series_id: null,
+    ...overrides,
+  }
+}
+
 const getCalendarMock = vi.hoisted(() => vi.fn(async () => new Blob(["BEGIN:VCALENDAR"])))
 const scrollIntoViewMock = vi.hoisted(() => vi.fn())
 const listEventsMock = vi.hoisted(() => vi.fn())
-const reviewData = vi.hoisted(() => ({
+const reviewData = vi.hoisted(
+  (): ReviewPayload => ({
   semester: {
     id: "semester-1",
     name: "Fall 2026",
@@ -64,6 +89,10 @@ const reviewData = vi.hoisted(() => ({
     end_date: "2026-12-18",
     timezone: "America/New_York",
     review_completed_at: "2026-09-01T12:00:00Z",
+    course_count: 2,
+    document_count: 2,
+    event_count: 1,
+    needs_review_count: 0,
   },
   courses: [
     {
@@ -153,6 +182,16 @@ function renderCalendarPage(initialEntry = "/calendar") {
 
 beforeEach(() => {
   const currentWeekWednesday = getDateInCurrentWeek(2)
+  reviewData.events = [
+    createReviewEvent({
+      id: "event-1",
+      title: "Final exam",
+      confidence: "low",
+      source_quote: "Final exam as scheduled by Registrar",
+      warning_codes: ["DATE_MISSING"],
+      warning_reason: "The event does not have a confirmed date.",
+    }),
+  ]
   getCalendarMock.mockClear()
   listEventsMock.mockClear()
   listEventsMock.mockImplementation(async (): Promise<ExtractedEvent[]> => [
@@ -243,7 +282,7 @@ test("shows the approved header actions, this week section, shared timeline scro
   expect(screen.getByRole("region", { name: "Course filters" })).toBeInTheDocument()
   expect(await screen.findByRole("button", { name: "Timeline" })).toHaveAttribute("aria-pressed", "true")
   expect(screen.getByLabelText("Current route")).toHaveTextContent("/calendar?view=timeline")
-  expect(screen.getByRole("button", { name: /Final exam/i })).toBeInTheDocument()
+  expect(screen.getByRole("link", { name: /Final exam/i })).toHaveAttribute("href", "/review?eventId=event-1")
   expect(screen.getByRole("heading", { name: "This week" })).toBeInTheDocument()
   expect(screen.getByRole("link", { name: /Office hours kickoff/i })).toHaveAttribute("href", "/review?eventId=event-4")
   expect(screen.getByText(formatWeekRangeFromDates(monday, sunday))).toBeInTheDocument()
@@ -431,4 +470,240 @@ test("computes the current natural week in the semester timezone instead of brow
 
   expect(range.startKey).toBe("2026-08-10")
   expect(range.endKey).toBe("2026-08-16")
+})
+
+test("separates review queue and awaiting dates while exposing course rules from course details", async () => {
+  const user = userEvent.setup()
+  const longRuleQuote =
+    "Weekly reading reflection due every Friday after lecture with a short response that cites one question from the assigned chapter and one idea you want to revisit during section."
+  reviewData.events = [
+    createReviewEvent({
+      id: "rule-1",
+      title: "Weekly reading cadence",
+      source_quote: longRuleQuote,
+      source_page: 4,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      review_status: "needs_review",
+    }),
+    createReviewEvent({
+      id: "rule-2",
+      title: "Lab attendance policy",
+      source_quote: "Lab attendance required every Tuesday",
+      source_page: 5,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      review_status: "pending",
+    }),
+    createReviewEvent({
+      id: "awaiting-1",
+      title: "Final exam date mismatch",
+      source_quote: "Final exam on December 10",
+      source_page: 8,
+      warning_codes: ["DATE_MISSING"],
+      review_status: "pending",
+    }),
+    createReviewEvent({
+      id: "queue-1",
+      title: "Project demo date mismatch",
+      event_date: "2026-10-20",
+      source_quote: "Project demo on October 20",
+      source_page: 11,
+      warning_codes: ["DATE_CONFLICT"],
+      review_status: "needs_review",
+    }),
+    createReviewEvent({
+      id: "recurring-pending-1",
+      title: "Recurring pending member",
+      recurring_series_id: "series-1",
+      review_status: "pending",
+    }),
+    createReviewEvent({
+      id: "recurring-review-1",
+      title: "Recurring review member",
+      event_date: "2026-10-22",
+      recurring_series_id: "series-1",
+      warning_codes: ["DATE_CONFLICT"],
+      review_status: "needs_review",
+    }),
+    createReviewEvent({
+      id: "rule-confirmed",
+      title: "Confirmed office hour pattern",
+      source_quote: "Office hours rotate every Thursday afternoon",
+      source_page: 9,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      review_status: "confirmed",
+    }),
+    createReviewEvent({
+      id: "rule-ignored",
+      title: "Ignored attendance pattern",
+      source_quote: "Attendance discussion repeats each Friday",
+      source_page: 10,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      review_status: "ignored",
+    }),
+  ]
+
+  renderCalendarPage()
+
+  expect(screen.queryByRole("heading", { name: "Course rules" })).not.toBeInTheDocument()
+  const courseDetailsButton = await screen.findByRole("button", { name: "CS 101" })
+  expect(courseDetailsButton).toHaveAttribute("aria-controls", "course-details-panel-course-1")
+  expect(courseDetailsButton).toHaveAttribute("aria-expanded", "false")
+  const calendarContentGrid = screen.getByRole("region", { name: "Course filters" })
+    .closest("aside")?.parentElement
+  expect(calendarContentGrid).toHaveClass("xl:grid-cols-[20rem_minmax(0,1fr)]")
+
+  await user.click(courseDetailsButton)
+
+  expect(courseDetailsButton).toHaveAttribute("aria-expanded", "true")
+  const detailsPanel = document.getElementById("course-details-panel-course-1")
+  expect(detailsPanel).not.toBeNull()
+  const statsList = within(detailsPanel as HTMLElement).getByTestId("course-details-stats")
+  const rulesHeader = within(detailsPanel as HTMLElement).getByTestId("course-rules-header")
+  expect(within(detailsPanel as HTMLElement).getByText("Intro to CS")).toBeInTheDocument()
+  expect(within(detailsPanel as HTMLElement).getByText("Dr. Rivera")).toBeInTheDocument()
+  expect(statsList).toHaveClass("space-y-2")
+  expect(statsList).not.toHaveClass("sm:grid-cols-3")
+  expect(within(detailsPanel as HTMLElement).getByText("Confirmed events").parentElement).toHaveTextContent("2")
+  expect(within(detailsPanel as HTMLElement).getByText("Awaiting dates").parentElement).toHaveTextContent("1")
+  expect(within(detailsPanel as HTMLElement).getByText("Saved rules").parentElement).toHaveTextContent("1")
+  expect(rulesHeader).toHaveClass("flex-col", "items-start")
+  expect(
+    within(detailsPanel as HTMLElement).getByRole("link", { name: /Weekly reading cadence/i }),
+  ).toHaveAttribute("href", "/review?eventId=rule-1")
+  expect(within(detailsPanel as HTMLElement).getByText("Needs review")).toBeInTheDocument()
+  const savedRuleStatus = within(detailsPanel as HTMLElement).getByText("Saved")
+  expect(savedRuleStatus).toBeInTheDocument()
+  expect(savedRuleStatus.parentElement).toHaveClass("flex-col")
+  expect(savedRuleStatus.parentElement).not.toHaveClass("sm:flex-row")
+  const longQuote = within(detailsPanel as HTMLElement).getByText(longRuleQuote)
+  expect(longQuote).toBeInTheDocument()
+  expect(longQuote).toHaveAttribute("title", longRuleQuote)
+  expect(within(detailsPanel as HTMLElement).getByText("Page 4")).toBeInTheDocument()
+  expect(within(detailsPanel as HTMLElement).getByText("Lab attendance required every Tuesday")).toBeInTheDocument()
+  expect(within(detailsPanel as HTMLElement).queryByText("Confirmed office hour pattern")).not.toBeInTheDocument()
+  expect(within(detailsPanel as HTMLElement).queryByText("Ignored attendance pattern")).not.toBeInTheDocument()
+  expect(screen.getByText("Office hours kickoff")).toBeInTheDocument()
+
+  const reviewQueueHeading = screen.getByRole("heading", { name: "Review queue" })
+  const reviewQueueCard = reviewQueueHeading.closest("section")
+  expect(reviewQueueCard).not.toBeNull()
+  expect(within(reviewQueueCard as HTMLElement).getByText("Project demo date mismatch")).toBeInTheDocument()
+  expect(within(reviewQueueCard as HTMLElement).queryByText("Final exam date mismatch")).not.toBeInTheDocument()
+  expect(within(reviewQueueCard as HTMLElement).queryByText("Weekly reading cadence")).not.toBeInTheDocument()
+  expect(within(reviewQueueCard as HTMLElement).queryByText("Lab attendance policy")).not.toBeInTheDocument()
+  expect(within(reviewQueueCard as HTMLElement).queryByText("Recurring review member")).not.toBeInTheDocument()
+  expect(within(reviewQueueCard as HTMLElement).queryByText("Confirmed office hour pattern")).not.toBeInTheDocument()
+  expect(within(reviewQueueCard as HTMLElement).queryByText("Ignored attendance pattern")).not.toBeInTheDocument()
+
+  const awaitingHeading = screen.getByRole("heading", { name: "Awaiting dates" })
+  const awaitingCard = awaitingHeading.closest("section")
+  expect(awaitingCard).not.toBeNull()
+  expect(within(awaitingCard as HTMLElement).getByText("Final exam date mismatch")).toBeInTheDocument()
+  expect(within(awaitingCard as HTMLElement).getByText("Awaiting date")).toBeInTheDocument()
+  expect(within(awaitingCard as HTMLElement).queryByText("Weekly reading cadence")).not.toBeInTheDocument()
+  expect(within(awaitingCard as HTMLElement).queryByText("Lab attendance policy")).not.toBeInTheDocument()
+  expect(within(awaitingCard as HTMLElement).queryByText("Recurring pending member")).not.toBeInTheDocument()
+
+  await user.click(screen.getByRole("link", { name: /Weekly reading cadence/i }))
+  expect(screen.getByLabelText("Current route")).toHaveTextContent("/review?eventId=rule-1")
+})
+
+test("course detail disclosure is independent from color and checkbox controls", async () => {
+  const user = userEvent.setup()
+  renderCalendarPage()
+
+  const row = await screen.findByTestId("course-filter-row-course-1")
+  const courseDetailsButton = await screen.findByRole("button", { name: "CS 101" })
+  const colorButton = screen.getByRole("button", { name: "Change color for CS 101" })
+  const checkbox = screen.getByRole("checkbox", { name: "CS 101" })
+  const checkboxHitArea = within(row).getByTestId("course-filter-checkbox-hit-area-course-1")
+
+  expect(within(row).getByRole("checkbox", { name: "CS 101" })).toBe(checkbox)
+  expect(within(row).getByRole("button", { name: "Change color for CS 101" })).toBe(colorButton)
+  expect(within(row).getByRole("button", { name: "CS 101" })).toBe(courseDetailsButton)
+  expect(checkboxHitArea).toHaveClass("min-h-11", "min-w-11", "cursor-pointer", "focus-within:ring-2")
+  expect(courseDetailsButton).toHaveAttribute("aria-controls", "course-details-panel-course-1")
+  expect(courseDetailsButton).toHaveAttribute("aria-expanded", "false")
+  expect(checkbox).toBeChecked()
+
+  await user.click(colorButton)
+
+  expect(screen.getByRole("group", { name: "Choose a color for CS 101" })).toBeInTheDocument()
+  expect(courseDetailsButton).toHaveAttribute("aria-expanded", "false")
+  expect(checkbox).toBeChecked()
+
+  await user.click(checkbox)
+
+  expect(checkbox).not.toBeChecked()
+  expect(courseDetailsButton).toHaveAttribute("aria-expanded", "false")
+
+  await user.click(courseDetailsButton)
+
+  expect(courseDetailsButton).toHaveAttribute("aria-expanded", "true")
+  const detailsPanel = document.getElementById("course-details-panel-course-1")
+  expect(detailsPanel).not.toBeNull()
+  expect(within(detailsPanel as HTMLElement).getByText("Intro to CS")).toBeInTheDocument()
+})
+
+test("course details empty state uses the updated rule copy", async () => {
+  const user = userEvent.setup()
+  reviewData.events = [
+    createReviewEvent({
+      id: "event-1",
+      title: "Office hours kickoff",
+      event_date: formatDateOffset(2),
+      warning_codes: [],
+      review_status: "confirmed",
+    }),
+  ]
+
+  renderCalendarPage()
+
+  await user.click(await screen.findByRole("button", { name: "CS 101" }))
+  const detailsPanel = document.getElementById("course-details-panel-course-1")
+  expect(detailsPanel).not.toBeNull()
+  expect(within(detailsPanel as HTMLElement).getByText("No course rules on file yet.")).toBeInTheDocument()
+  expect(within(detailsPanel as HTMLElement).queryByText("No saved or pending course rules yet.")).not.toBeInTheDocument()
+})
+
+test("only one course details panel stays open at a time", async () => {
+  const user = userEvent.setup()
+  reviewData.events = [
+    createReviewEvent({
+      id: "rule-1",
+      course_id: "course-1",
+      title: "Weekly reading cadence",
+      source_quote: "Weekly reading reflection due every Friday",
+      source_page: 4,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      review_status: "pending",
+    }),
+    createReviewEvent({
+      id: "rule-2",
+      course_id: "course-2",
+      document_id: "document-2",
+      title: "Discussion post rhythm",
+      source_quote: "Discussion post due every Wednesday night",
+      source_page: 6,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      review_status: "needs_review",
+    }),
+  ]
+
+  renderCalendarPage()
+
+  const csCourseButton = await screen.findByRole("button", { name: "CS 101" })
+  const mathCourseButton = screen.getByRole("button", { name: "MATH 201" })
+
+  await user.click(csCourseButton)
+  expect(csCourseButton).toHaveAttribute("aria-expanded", "true")
+  expect(mathCourseButton).toHaveAttribute("aria-expanded", "false")
+  expect(screen.getByText("Weekly reading cadence")).toBeInTheDocument()
+
+  await user.click(mathCourseButton)
+
+  expect(csCourseButton).toHaveAttribute("aria-expanded", "false")
+  expect(mathCourseButton).toHaveAttribute("aria-expanded", "true")
+  expect(screen.queryByText("Weekly reading cadence")).not.toBeInTheDocument()
+  expect(screen.getByText("Discussion post rhythm")).toBeInTheDocument()
 })

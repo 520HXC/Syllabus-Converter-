@@ -7,6 +7,7 @@ from uuid import UUID
 import pymupdf
 import pytest
 from icalendar import Calendar
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -114,6 +115,152 @@ def seed_review_data(app) -> tuple[UUID, UUID, UUID]:
         session.add_all([confirmed, needs_review])
         session.commit()
         return semester.id, confirmed.id, needs_review.id
+
+
+def seed_course_rule_review_data(app) -> tuple[UUID, UUID, UUID]:
+    session_factory = app.state.session_factory
+    with session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2026",
+            start_date=date(2026, 8, 24),
+            end_date=date(2026, 12, 18),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        course = Course(
+            user_id=USER_A,
+            semester_id=semester.id,
+            code="CS 101",
+            name="Introduction to Computer Science",
+            color="#0D9488",
+        )
+        session.add(course)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="cs101.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester.id}/cs101.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.NEEDS_REVIEW,
+        )
+        session.add(job)
+        confirmed = ExtractedEvent(
+            user_id=USER_A,
+            semester_id=semester.id,
+            course_id=course.id,
+            title="Midterm exam",
+            event_type="exam",
+            event_date=date(2026, 10, 14),
+            timezone="America/New_York",
+            is_all_day=True,
+            source_quote="Midterm exam October 14, 2026",
+            source_page=2,
+            confidence=ConfidenceLevel.HIGH,
+            warning_codes=[],
+            extraction_model="gpt-5.6-luna",
+            fallback_reason_codes=[],
+            review_status=ReviewStatus.CONFIRMED,
+        )
+        course_rule = ExtractedEvent(
+            user_id=USER_A,
+            semester_id=semester.id,
+            course_id=course.id,
+            title="Exercise Sets",
+            event_type="assignment",
+            event_date=None,
+            timezone="America/New_York",
+            is_all_day=True,
+            source_quote="Exercise Sets due 8AM after the lecture",
+            source_page=5,
+            confidence=ConfidenceLevel.MEDIUM,
+            warning_codes=["AMBIGUOUS_RECURRENCE"],
+            warning_reason="The syllabus does not identify every occurrence.",
+            extraction_model="gpt-5.6-luna",
+            fallback_reason_codes=[],
+            review_status=ReviewStatus.NEEDS_REVIEW,
+        )
+        session.add_all([confirmed, course_rule])
+        session.commit()
+        return semester.id, confirmed.id, course_rule.id
+
+
+def seed_legacy_syllabus_typo_review_data(app) -> tuple[UUID, UUID, UUID]:
+    session_factory = app.state.session_factory
+    with session_factory() as session:
+        semester = Semester(
+            user_id=USER_A,
+            name="Fall 2025",
+            start_date=date(2025, 8, 25),
+            end_date=date(2025, 12, 20),
+            timezone="America/New_York",
+        )
+        session.add(semester)
+        session.flush()
+        course = Course(
+            user_id=USER_A,
+            semester_id=semester.id,
+            code="CS-UY 1114",
+            name="Introduction to Programming and Problem Solving",
+            color="#0D9488",
+        )
+        session.add(course)
+        session.flush()
+        document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester.id,
+            filename="Fall_2025_Syllabus.pdf",
+            content_type="application/pdf",
+            size_bytes=341085,
+            storage_key=f"{USER_A}/{semester.id}/Fall_2025_Syllabus.pdf",
+        )
+        job = ProcessingJob(
+            user_id=USER_A,
+            semester_id=semester.id,
+            document=document,
+            status=JobStatus.NEEDS_REVIEW,
+            primary_model="gpt-5.6-luna",
+            fallback_model="gpt-5.6-terra",
+            fallback_used=True,
+            fallback_reason_codes=["DATE_CONFLICT"],
+        )
+        session.add(job)
+        session.flush()
+        event = ExtractedEvent(
+            user_id=USER_A,
+            semester_id=semester.id,
+            course_id=course.id,
+            document_id=document.id,
+            title="No Lecture / Friday schedule",
+            event_type="class",
+            event_date=date(2025, 11, 27),
+            timezone="America/New_York",
+            is_all_day=True,
+            source_quote="27-Nov Wednesday No Lecture, Friday Schedule",
+            source_page=4,
+            confidence=ConfidenceLevel.MEDIUM,
+            warning_codes=["DATE_CONFLICT", "YEAR_NOT_EXPLICIT", "MODEL_UNCERTAINTY"],
+            warning_reason=(
+                "The syllabus says Wednesday, but November 27, 2025 is Thursday. "
+                "The source does not explicitly state a year. "
+                "Terra repaired Date Conflict and shifted the event to November 26."
+            ),
+            extraction_model="gpt-5.6-terra",
+            fallback_reason_codes=["DATE_CONFLICT"],
+            derivation_summary="Legacy Terra repair explanation that should not stay visible.",
+            review_status=ReviewStatus.NEEDS_REVIEW,
+        )
+        session.add(event)
+        session.commit()
+        return semester.id, job.id, event.id
 
 
 def seed_recurring_series_data(app) -> tuple[UUID, UUID, UUID]:
@@ -577,6 +724,117 @@ def test_review_exposes_evidence_and_allows_confirm_or_ignore(app_client):
     assert update.json()["review_status"] == "confirmed"
 
 
+def test_review_sanitizes_legacy_syllabus_typo_without_reprocessing(app_client):
+    client, app = app_client
+    semester_id, _, event_id = seed_legacy_syllabus_typo_review_data(app)
+
+    review = client.get(
+        f"/api/semesters/{semester_id}/review",
+        headers=auth_headers(),
+    )
+
+    assert review.status_code == 200
+    event = next(item for item in review.json()["events"] if item["id"] == str(event_id))
+    assert event["extraction_model"] == "gpt-5.6-terra"
+    assert event["warning_codes"] == ["DATE_CONFLICT"]
+    assert (
+        event["warning_reason"]
+        == "Syllabus typo. The written date and weekday do not match. The numeric date was kept."
+    )
+    assert event["fallback_reason_codes"] == []
+    assert event["derivation_summary"] is None
+
+
+def test_update_event_response_sanitizes_legacy_syllabus_typo_fields(app_client):
+    client, app = app_client
+    _, _, event_id = seed_legacy_syllabus_typo_review_data(app)
+
+    response = client.patch(
+        f"/api/extracted-events/{event_id}",
+        headers=auth_headers(),
+        json={"title": "No lecture / Friday schedule"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["extraction_model"] == "gpt-5.6-terra"
+    assert payload["warning_codes"] == ["DATE_CONFLICT"]
+    assert (
+        payload["warning_reason"]
+        == "Syllabus typo. The written date and weekday do not match. The numeric date was kept."
+    )
+    assert payload["fallback_reason_codes"] == []
+    assert payload["derivation_summary"] is None
+
+
+def test_jobs_sanitize_legacy_syllabus_typo_fallback_when_it_is_the_only_reason(app_client):
+    client, app = app_client
+    semester_id, _, _ = seed_legacy_syllabus_typo_review_data(app)
+
+    response = client.get(
+        f"/api/semesters/{semester_id}/jobs",
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()[0]["fallback_used"] is False
+    assert response.json()[0]["fallback_reason_codes"] == []
+
+
+def test_legacy_typo_compatibility_keeps_a_real_cross_event_conflict_visible(app_client):
+    client, app = app_client
+    semester_id, _, event_id = seed_legacy_syllabus_typo_review_data(app)
+    with app.state.session_factory() as session:
+        original = session.get(ExtractedEvent, event_id)
+        assert original is not None
+        second_document = SyllabusDocument(
+            user_id=USER_A,
+            semester_id=semester_id,
+            filename="registrar-update.pdf",
+            content_type="application/pdf",
+            size_bytes=100,
+            storage_key=f"{USER_A}/{semester_id}/registrar-update.pdf",
+        )
+        session.add(second_document)
+        session.flush()
+        session.add(
+            ExtractedEvent(
+                user_id=USER_A,
+                semester_id=semester_id,
+                course_id=original.course_id,
+                document_id=second_document.id,
+                title=original.title,
+                event_type="class",
+                event_date=date(2025, 11, 26),
+                timezone="America/New_York",
+                is_all_day=True,
+                source_quote="Registrar update lists November 26",
+                source_page=1,
+                confidence=ConfidenceLevel.HIGH,
+                warning_codes=[],
+                review_status=ReviewStatus.NEEDS_REVIEW,
+            )
+        )
+        session.commit()
+
+    review = client.get(
+        f"/api/semesters/{semester_id}/review",
+        headers=auth_headers(),
+    )
+    jobs = client.get(
+        f"/api/semesters/{semester_id}/jobs",
+        headers=auth_headers(),
+    )
+
+    assert review.status_code == 200
+    event = next(item for item in review.json()["events"] if item["id"] == str(event_id))
+    assert "MODEL_UNCERTAINTY" in event["warning_codes"]
+    assert "Terra repaired Date Conflict" in event["warning_reason"]
+    assert event["fallback_reason_codes"] == ["DATE_CONFLICT"]
+    assert jobs.json()[0]["fallback_used"] is True
+    assert jobs.json()[0]["fallback_reason_codes"] == ["DATE_CONFLICT"]
+
+
 def test_review_exposes_recurring_series_and_model_audit_fields(app_client):
     client, app = app_client
     semester_id, series_id, _ = seed_recurring_series_data(app)
@@ -843,6 +1101,55 @@ def test_reprocess_job_keeps_previous_review_data_when_processing_fails(
         assert semester.review_completed_at == datetime(2026, 8, 25)
 
 
+def test_reprocess_job_keeps_previous_review_data_when_failure_happens_after_delete(
+    app_client, monkeypatch
+):
+    client, app = app_client
+    semester_id, job_id, _, storage_key = seed_reprocess_data(app)
+    upload_root = Path(app.state.settings.local_storage_path)
+    file_path = upload_root / storage_key
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(make_pdf("CS 101 Midterm exam October 14, 2026. " * 8))
+
+    monkeypatch.setattr(
+        "app.processing.extract_syllabus",
+        lambda pages, settings: SyllabusExtraction(
+            course_code="CS 101",
+            course_name="Introduction to Computer Science",
+            instructor="Dr. Rivera",
+            events=[
+                CandidateEvent(
+                    title="New midterm",
+                    event_type="exam",
+                    event_date=date(2026, 10, 14),
+                    start_time=None,
+                    end_time=None,
+                    is_all_day=True,
+                    source_quote="Midterm exam October 14, 2026",
+                    source_page=1,
+                    confidence="high",
+                    year_was_explicit=True,
+                    uncertainty_reason=None,
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        "app.processing.expand_recurring_rules",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("series exploded")),
+    )
+
+    response = client.post(f"/api/jobs/{job_id}/reprocess", headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    with app.state.session_factory() as session:
+        semester = session.get(Semester, semester_id)
+        titles = [event.title for event in session.query(ExtractedEvent).all()]
+        assert titles == ["Old midterm"]
+        assert semester.review_completed_at == datetime(2026, 8, 25)
+
+
 def test_reprocess_rejects_active_or_failed_jobs(app_client):
     client, app = app_client
     _, active_job_id, _, _ = seed_reprocess_data(app)
@@ -931,6 +1238,164 @@ def test_undated_item_can_stay_pending_but_cannot_be_confirmed(app_client):
         headers=auth_headers(),
     ).json()
     assert [event["id"] for event in events] == [str(confirmed_id)]
+
+    calendar = client.get(
+        f"/api/semesters/{semester_id}/calendar.ics",
+        headers=auth_headers(),
+    )
+    assert calendar.status_code == 200
+    assert "Midterm exam" in calendar.text
+    assert "Final project" not in calendar.text
+
+
+def test_course_rule_cannot_be_confirmed_as_single_event_and_state_does_not_mutate(
+    app_client,
+):
+    client, app = app_client
+    _, _, event_id = seed_course_rule_review_data(app)
+
+    rejected = client.patch(
+        f"/api/extracted-events/{event_id}",
+        headers=auth_headers(),
+        json={
+            "title": "Changed title",
+            "event_date": "2026-09-11",
+            "review_status": "confirmed",
+        },
+    )
+
+    assert rejected.status_code == 422
+    assert (
+        rejected.json()["detail"]
+        == "Course rules cannot be published as a single calendar event."
+    )
+
+    with app.state.session_factory() as session:
+        event = session.get(ExtractedEvent, event_id)
+        assert event is not None
+        assert event.title == "Exercise Sets"
+        assert event.event_date is None
+        assert event.review_status == ReviewStatus.NEEDS_REVIEW
+
+
+def test_course_rule_can_be_saved_pending_and_no_longer_blocks_review_completion(
+    app_client,
+):
+    client, app = app_client
+    semester_id, confirmed_id, event_id = seed_course_rule_review_data(app)
+
+    pending = client.patch(
+        f"/api/extracted-events/{event_id}",
+        headers=auth_headers(),
+        json={"review_status": "pending"},
+    )
+
+    assert pending.status_code == 200
+    assert pending.json()["review_status"] == "pending"
+    assert pending.json()["event_date"] is None
+
+    completed = client.post(
+        f"/api/semesters/{semester_id}/review/complete",
+        headers=auth_headers(),
+    )
+
+    assert completed.status_code == 200
+    events = client.get(
+        f"/api/semesters/{semester_id}/events",
+        headers=auth_headers(),
+    ).json()
+    assert [event["id"] for event in events] == [str(confirmed_id)]
+
+
+def test_legacy_confirmed_course_rule_still_rejects_partial_updates_without_mutation(
+    app_client,
+):
+    client, app = app_client
+    _, _, event_id = seed_course_rule_review_data(app)
+    with app.state.session_factory() as session:
+        event = session.get(ExtractedEvent, event_id)
+        event.review_status = ReviewStatus.CONFIRMED
+        event.event_date = date(2026, 9, 11)
+        session.commit()
+
+    rejected = client.patch(
+        f"/api/extracted-events/{event_id}",
+        headers=auth_headers(),
+        json={"title": "Edited legacy rule"},
+    )
+
+    assert rejected.status_code == 422
+    assert (
+        rejected.json()["detail"]
+        == "Course rules cannot be published as a single calendar event."
+    )
+
+    with app.state.session_factory() as session:
+        event = session.get(ExtractedEvent, event_id)
+        assert event is not None
+        assert event.title == "Exercise Sets"
+        assert event.event_date == date(2026, 9, 11)
+        assert event.review_status == ReviewStatus.CONFIRMED
+
+
+def test_exact_recurring_series_event_can_still_be_confirmed(app_client):
+    client, app = app_client
+    _, series_id, _ = seed_recurring_series_data(app)
+    with app.state.session_factory() as session:
+        event_id = session.scalar(
+            select(ExtractedEvent.id)
+            .where(ExtractedEvent.recurring_series_id == series_id)
+            .order_by(ExtractedEvent.event_date.asc())
+        )
+
+    confirmed = client.patch(
+        f"/api/extracted-events/{event_id}",
+        headers=auth_headers(),
+        json={"review_status": "confirmed"},
+    )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["review_status"] == "confirmed"
+    assert confirmed.json()["recurring_series_id"] == str(series_id)
+
+
+def test_legacy_confirmed_course_rule_is_excluded_from_confirmed_events_api(app_client):
+    client, app = app_client
+    semester_id, confirmed_id, event_id = seed_course_rule_review_data(app)
+    with app.state.session_factory() as session:
+        event = session.get(ExtractedEvent, event_id)
+        event.review_status = ReviewStatus.CONFIRMED
+        event.event_date = date(2026, 9, 11)
+        session.commit()
+
+    events = client.get(
+        f"/api/semesters/{semester_id}/events",
+        headers=auth_headers(),
+    )
+
+    assert events.status_code == 200
+    assert [event["id"] for event in events.json()] == [str(confirmed_id)]
+
+
+def test_legacy_confirmed_course_rule_is_excluded_from_ics_export(app_client):
+    client, app = app_client
+    semester_id, _, event_id = seed_course_rule_review_data(app)
+    with app.state.session_factory() as session:
+        event = session.get(ExtractedEvent, event_id)
+        event.review_status = ReviewStatus.CONFIRMED
+        event.event_date = date(2026, 9, 11)
+        session.commit()
+
+    response = client.get(
+        f"/api/semesters/{semester_id}/calendar.ics",
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    calendar = Calendar.from_ical(response.content)
+    calendar_events = [item for item in calendar.walk() if item.name == "VEVENT"]
+    assert len(calendar_events) == 1
+    assert str(calendar_events[0]["SUMMARY"]) == "CS 101 · Midterm exam"
 
 
 def test_calendar_and_ics_include_only_confirmed_events(app_client):

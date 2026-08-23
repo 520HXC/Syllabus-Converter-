@@ -5,8 +5,8 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
-  Clock3,
   FileText,
+  Info,
   PencilLine,
   Repeat,
   Save,
@@ -15,6 +15,7 @@ import {
 } from "lucide-react"
 
 import { EventTypeBadge } from "./EventTypeBadge"
+import { isAwaitingDate } from "../lib/awaitingDate"
 import { formatFallbackReasons } from "../lib/modelRouting"
 import { getConfidenceBadgeClass } from "../lib/reviewBadges"
 import { getReviewAttentionTarget, getReviewFallbackMessage } from "../lib/review"
@@ -41,6 +42,9 @@ const eventTypeSuggestions = [
   "reading",
 ]
 
+const SYLLABUS_TYPO_WARNING =
+  "Syllabus typo. The written date and weekday do not match. The numeric date was kept."
+
 function formatConfidence(confidence: ExtractedEvent["confidence"]) {
   if (confidence === "high") return "High confidence"
   if (confidence === "medium") return "Medium confidence"
@@ -64,6 +68,12 @@ function normalizeTimeValue(time: string) {
 }
 
 function getStatusChip(event: ExtractedEvent) {
+  if (isAwaitingDate(event)) {
+    return {
+      copy: "Saved for later",
+      className: "border border-accent/15 bg-accent/10 text-accent",
+    }
+  }
   if (event.review_status === "pending") {
     return {
       copy: "Pending",
@@ -86,6 +96,10 @@ function hasAmbiguousRecurrenceWarning(warningCodes: string[]) {
   return warningCodes.includes("AMBIGUOUS_RECURRENCE")
 }
 
+function isSyllabusTypoWarning(event: ExtractedEvent) {
+  return event.warning_codes.includes("DATE_CONFLICT") && event.warning_reason === SYLLABUS_TYPO_WARNING
+}
+
 export function ReviewEventCard({
   event,
   courseLabel,
@@ -104,6 +118,7 @@ export function ReviewEventCard({
   const errorId = useId()
   const titleId = useId()
   const editorId = useId()
+  const typoNoteId = useId()
   const modifyButtonRef = useRef<HTMLButtonElement>(null)
   const titleRef = useRef<HTMLInputElement>(null)
   const eventDateRef = useRef<HTMLInputElement>(null)
@@ -122,23 +137,49 @@ export function ReviewEventCard({
 
   const attentionTarget = getReviewAttentionTarget(event.warning_codes)
   const hasAmbiguousRecurrence = hasAmbiguousRecurrenceWarning(event.warning_codes)
+  const hasSyllabusTypoWarning = isSyllabusTypoWarning(event)
   const warningMessage = hasAmbiguousRecurrence
     ? getReviewFallbackMessage(event.warning_codes)
     : event.warning_reason ?? getReviewFallbackMessage(event.warning_codes)
   const isNeedsReview = event.review_status === "needs_review"
+  const isRecurringSeriesMember = Boolean(event.recurring_series_id)
+  const awaitingDate = isAwaitingDate(event)
+  const isUndatedStandardEvent =
+    !isRecurringSeriesMember && !hasAmbiguousRecurrence && event.event_date === null
+  const isUndatedSaveFlow =
+    !isRecurringSeriesMember &&
+    !hasAmbiguousRecurrence &&
+    (awaitingDate || (isNeedsReview && event.event_date === null))
+  const hideFooterActions = isEditing && isUndatedSaveFlow
   const dateError = errorTarget === "date" ? error : null
   const generalError = errorTarget === "general" ? error : null
   const statusChip = getStatusChip(event)
+  const highlightDateField = isNeedsReview && attentionTarget === "date" && !hasSyllabusTypoWarning
+  const highlightSourceField =
+    isNeedsReview && (attentionTarget === "source" || hasSyllabusTypoWarning)
+  const highlightCard = isNeedsReview && attentionTarget === "card" && !hasSyllabusTypoWarning
+  const primaryEditorAction = isUndatedSaveFlow
+    ? {
+        label: eventDate ? "Save and confirm" : "Save for later",
+        loadingLabel: eventDate ? "Saving and confirming..." : "Saving for later...",
+        reviewStatus: (eventDate ? "confirmed" : "pending") as ReviewStatus,
+      }
+    : null
   const dateDescriptionIds = [
-    isNeedsReview && attentionTarget === "date" ? `review-warning-${warningId}` : null,
+    highlightDateField ? `review-warning-${warningId}` : null,
     errorTarget === "date" && error ? `review-error-${errorId}` : null,
   ]
     .filter(Boolean)
     .join(" ") || undefined
-  const sourceDescriptionIds =
-    isNeedsReview && attentionTarget === "source" ? `review-warning-${warningId}` : undefined
-  const cardDescriptionIds =
-    isNeedsReview && attentionTarget === "card" ? `review-warning-${warningId}` : undefined
+  const sourceDescriptionIds = hasSyllabusTypoWarning
+    ? typoNoteId
+    : highlightSourceField
+      ? `review-warning-${warningId}`
+      : undefined
+  const cardDescriptionIds = highlightCard ? `review-warning-${warningId}` : undefined
+  const visibleFallbackReasons = hasSyllabusTypoWarning
+    ? formatFallbackReasons((event.fallback_reason_codes ?? []).filter((code) => code !== "DATE_CONFLICT"))
+    : fallbackReasons
 
   function resetDraft() {
     setTitle(event.title)
@@ -157,9 +198,9 @@ export function ReviewEventCard({
 
   useEffect(() => {
     if (!startEditing) return
-    setEditorFocusTarget(attentionTarget === "date" ? "date" : "name")
+    setEditorFocusTarget(highlightDateField || awaitingDate ? "date" : "name")
     setIsEditing(true)
-  }, [attentionTarget, event.id, startEditing])
+  }, [awaitingDate, event.id, highlightDateField, startEditing])
 
   useLayoutEffect(() => {
     if (!isEditing || !editorFocusTarget) return
@@ -169,7 +210,7 @@ export function ReviewEventCard({
   }, [editorFocusTarget, isEditing])
 
   function openEditor() {
-    setEditorFocusTarget(attentionTarget === "date" ? "date" : "name")
+    setEditorFocusTarget(highlightDateField || awaitingDate ? "date" : "name")
     setIsEditing(true)
     setError(null)
     setErrorTarget("general")
@@ -179,7 +220,7 @@ export function ReviewEventCard({
     resetDraft()
     setIsEditing(false)
     setShowMoreOptions(false)
-    modifyButtonRef.current?.focus()
+    requestAnimationFrame(() => modifyButtonRef.current?.focus())
   }
 
   async function save(reviewStatus: ReviewStatus, closeEditor = false) {
@@ -191,7 +232,7 @@ export function ReviewEventCard({
       return
     }
 
-    setSaving(closeEditor ? "changes" : reviewStatus)
+    setSaving(closeEditor && !primaryEditorAction ? "changes" : reviewStatus)
     setError(null)
     setErrorTarget("general")
     try {
@@ -229,11 +270,11 @@ export function ReviewEventCard({
       className={cn(
         "relative overflow-hidden border-border/80 bg-panel/95 p-4 shadow-panel sm:p-5",
         isNeedsReview && "border-warning-border",
-        isNeedsReview && attentionTarget === "card" && "ring-2 ring-warning/20",
+        highlightCard && "ring-2 ring-warning/20",
       )}
-      data-focus-target={isNeedsReview && attentionTarget === "card" ? "card" : undefined}
+      data-focus-target={highlightCard ? "card" : undefined}
       data-review-event-id={event.id}
-      tabIndex={isNeedsReview && attentionTarget === "card" ? -1 : undefined}
+      tabIndex={highlightCard ? -1 : undefined}
     >
       <span
         aria-hidden="true"
@@ -273,8 +314,8 @@ export function ReviewEventCard({
             <h3 className="text-lg font-semibold tracking-[-0.02em] text-text" id={titleId}>
               {event.title}
             </h3>
-            {event.extraction_model?.includes("terra") && fallbackReasons ? (
-              <p className="mt-1 text-xs font-medium text-warning">Terra repaired {fallbackReasons}</p>
+            {event.extraction_model?.includes("terra") && visibleFallbackReasons ? (
+              <p className="mt-1 text-xs font-medium text-warning">Terra repaired {visibleFallbackReasons}</p>
             ) : null}
           </div>
         </header>
@@ -284,17 +325,17 @@ export function ReviewEventCard({
             aria-describedby={dateDescriptionIds}
             className={cn(
               "rounded-xl border border-border/80 bg-panel-muted/35 px-3.5 py-3",
-              isNeedsReview && attentionTarget === "date" && "border-warning-border bg-warning-soft/60",
+              highlightDateField && "border-warning-border bg-warning-soft/60",
             )}
-            data-focus-target={isNeedsReview && attentionTarget === "date" ? "date" : undefined}
-            tabIndex={isNeedsReview && attentionTarget === "date" ? -1 : undefined}
+            data-focus-target={highlightDateField ? "date" : undefined}
+            tabIndex={highlightDateField ? -1 : undefined}
           >
             <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-text-subtle">
               <CalendarClock aria-hidden="true" className="size-3.5 text-accent" />
-              AI date
+              {awaitingDate ? "Pending date" : "AI date"}
             </p>
             <p className="mt-1.5 text-sm font-semibold text-text">
-              {formatSuggestedDate(event.event_date)}
+              {awaitingDate ? "Awaiting a confirmed date" : formatSuggestedDate(event.event_date)}
             </p>
           </div>
 
@@ -302,10 +343,10 @@ export function ReviewEventCard({
             aria-describedby={sourceDescriptionIds}
             className={cn(
               "rounded-xl border border-border/80 bg-panel-muted/35 px-3.5 py-3",
-              isNeedsReview && attentionTarget === "source" && "border-warning-border bg-warning-soft/60",
+              highlightSourceField && "border-warning-border bg-warning-soft/60",
             )}
-            data-focus-target={isNeedsReview && attentionTarget === "source" ? "source" : undefined}
-            tabIndex={isNeedsReview && attentionTarget === "source" ? -1 : undefined}
+            data-focus-target={highlightSourceField ? "source" : undefined}
+            tabIndex={highlightSourceField ? -1 : undefined}
           >
             <div className="flex items-center justify-between gap-3">
               <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-text-subtle">
@@ -317,10 +358,22 @@ export function ReviewEventCard({
             <blockquote className="mt-1.5 border-l-2 border-border-strong pl-3 text-sm leading-6 text-text">
               "{event.source_quote}"
             </blockquote>
+            {hasSyllabusTypoWarning ? (
+              <div
+                className="mt-3 flex gap-2 rounded-xl border border-warning-border/70 bg-warning-soft/55 px-3 py-2 text-sm text-warning"
+                id={typoNoteId}
+              >
+                <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                <div>
+                  <p className="font-semibold">Syllabus typo</p>
+                  <p className="mt-0.5 leading-6">{SYLLABUS_TYPO_WARNING}</p>
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
 
-        {isNeedsReview ? (
+        {isNeedsReview && !hasSyllabusTypoWarning ? (
           <div
             className="flex gap-2.5 rounded-xl border border-warning-border bg-warning-soft px-3.5 py-3 text-sm text-warning"
             id={`review-warning-${warningId}`}
@@ -333,7 +386,7 @@ export function ReviewEventCard({
           </div>
         ) : null}
 
-        {event.derivation_summary ? (
+        {event.derivation_summary && !hasSyllabusTypoWarning ? (
           <div className="rounded-xl border border-accent/20 bg-accent/10 px-3.5 py-3 text-sm text-text-muted">
             <p className="font-semibold text-text">
               {hasAmbiguousRecurrence ? "Why dates were not generated" : "Calculated date"}
@@ -367,9 +420,7 @@ export function ReviewEventCard({
                     aria-invalid={dateError ? "true" : undefined}
                     aria-label="Event date"
                     className={cn(
-                      isNeedsReview &&
-                        attentionTarget === "date" &&
-                        "border-warning-border focus:border-warning focus:ring-warning/20",
+                      highlightDateField && "border-warning-border focus:border-warning focus:ring-warning/20",
                     )}
                     ref={eventDateRef}
                     type="date"
@@ -471,14 +522,32 @@ export function ReviewEventCard({
                 <X aria-hidden="true" className="size-4" />
                 Cancel
               </Button>
-              <Button
-                loading={saving === "changes"}
-                onClick={() => void save(event.review_status, true)}
-                type="button"
-              >
-                <Save aria-hidden="true" className="size-4" />
-                Save changes
-              </Button>
+              {primaryEditorAction ? (
+                <Button
+                  aria-label={primaryEditorAction.label}
+                  loading={saving === primaryEditorAction.reviewStatus}
+                  onClick={() => void save(primaryEditorAction.reviewStatus, true)}
+                  type="button"
+                >
+                  {primaryEditorAction.reviewStatus === "confirmed" ? (
+                    <Check aria-hidden="true" className="size-4" />
+                  ) : (
+                    <Save aria-hidden="true" className="size-4" />
+                  )}
+                  {saving === primaryEditorAction.reviewStatus
+                    ? primaryEditorAction.loadingLabel
+                    : primaryEditorAction.label}
+                </Button>
+              ) : (
+                <Button
+                  loading={saving === "changes"}
+                  onClick={() => void save(event.review_status, true)}
+                  type="button"
+                >
+                  <Save aria-hidden="true" className="size-4" />
+                  {saving === "changes" ? "Saving changes..." : "Save changes"}
+                </Button>
+              )}
             </div>
           </section>
         ) : null}
@@ -491,55 +560,84 @@ export function ReviewEventCard({
 
         <div className="flex flex-col gap-3 border-t border-border/80 pt-3 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-sm text-text-muted">
-            Confirm publishes this date. Keep pending leaves it outside the calendar.
+            {awaitingDate
+              ? "Saved for later until you add a date and confirm it."
+              : isRecurringSeriesMember
+                ? "Confirm publishes this occurrence. Manage the series from its recurring rule."
+              : isUndatedStandardEvent
+                ? "Add a date to confirm this event, or save it for later."
+                : "Confirm publishes this date. Save for later keeps it outside the calendar."}
           </p>
-          <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
-            <Button
-              aria-controls={editorId}
-              aria-expanded={isEditing}
-              aria-label={`Modify ${event.title}`}
-              onClick={isEditing ? cancelEditing : openEditor}
-              ref={modifyButtonRef}
-              type="button"
-              variant="secondary"
-            >
-              <PencilLine aria-hidden="true" className="size-4" />
-              {isEditing ? "Close editor" : "Modify"}
-            </Button>
-            <Button
-              aria-label="Remove"
-              loading={saving === "ignored"}
-              onClick={() => void save("ignored")}
-              type="button"
-              variant="danger"
-            >
-              <Trash2 aria-hidden="true" className="size-4" />
-              Remove
-            </Button>
-            <Button
-              aria-label="Keep pending"
-              loading={saving === "pending"}
-              onClick={() => void save("pending")}
-              type="button"
-              variant="secondary"
-            >
-              <Clock3 aria-hidden="true" className="size-4" />
-              Keep pending
-            </Button>
-            <Button
-              aria-label="Confirm"
-              loading={saving === "confirmed"}
-              onClick={() => void save("confirmed")}
-              type="button"
-            >
-              {event.review_status === "confirmed" ? (
-                <CheckCircle2 aria-hidden="true" className="size-4" />
+          {!hideFooterActions ? (
+            <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:justify-end">
+              <Button
+                aria-controls={editorId}
+                aria-expanded={isEditing}
+                aria-label={`Modify ${event.title}`}
+                onClick={openEditor}
+                ref={modifyButtonRef}
+                type="button"
+                variant="secondary"
+              >
+                <PencilLine aria-hidden="true" className="size-4" />
+                Modify
+              </Button>
+              <Button
+                aria-label="Remove"
+                loading={saving === "ignored"}
+                onClick={() => void save("ignored")}
+                type="button"
+                variant="danger"
+              >
+                <Trash2 aria-hidden="true" className="size-4" />
+                Remove
+              </Button>
+              {awaitingDate ? (
+                <Button onClick={openEditor} type="button">
+                  <CalendarClock aria-hidden="true" className="size-4" />
+                  Add date
+                </Button>
+              ) : isUndatedStandardEvent ? (
+                <Button
+                  aria-label="Save for later"
+                  loading={saving === "pending"}
+                  onClick={() => void save("pending")}
+                  type="button"
+                >
+                  <Save aria-hidden="true" className="size-4" />
+                  {saving === "pending" ? "Saving for later..." : "Save for later"}
+                </Button>
               ) : (
-                <Check aria-hidden="true" className="size-4" />
+                <>
+                  {!isRecurringSeriesMember ? (
+                    <Button
+                      aria-label="Save for later"
+                      loading={saving === "pending"}
+                      onClick={() => void save("pending")}
+                      type="button"
+                      variant="secondary"
+                    >
+                      <Save aria-hidden="true" className="size-4" />
+                      {saving === "pending" ? "Saving for later..." : "Save for later"}
+                    </Button>
+                  ) : null}
+                  <Button
+                    aria-label="Confirm"
+                    loading={saving === "confirmed"}
+                    onClick={() => void save("confirmed")}
+                    type="button"
+                  >
+                    {event.review_status === "confirmed" ? (
+                      <CheckCircle2 aria-hidden="true" className="size-4" />
+                    ) : (
+                      <Check aria-hidden="true" className="size-4" />
+                    )}
+                    {saving === "confirmed" ? "Saving and confirming..." : "Confirm"}
+                  </Button>
+                </>
               )}
-              Confirm
-            </Button>
-          </div>
+            </div>
+          ) : null}
         </div>
       </div>
     </Card>

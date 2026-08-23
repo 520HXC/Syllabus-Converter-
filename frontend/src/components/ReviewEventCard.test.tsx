@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react"
+import { render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 
 import { ReviewEventCard } from "./ReviewEventCard"
@@ -26,6 +26,15 @@ const event = {
 const defaultProps = {
   courseLabel: "CS 101",
   courseColor: "#0D9488",
+}
+
+function createDeferredPromise() {
+  let resolve!: () => void
+  const promise = new Promise<void>((nextResolve) => {
+    resolve = nextResolve
+  })
+
+  return { promise, resolve }
 }
 
 test("shows a compact summary before modification", () => {
@@ -172,7 +181,7 @@ test("cancels draft changes and returns focus to Modify", async () => {
   await user.type(screen.getByLabelText("Event name"), "Wrong draft")
   await user.click(screen.getByRole("button", { name: "Cancel" }))
 
-  expect(modifyButton).toHaveFocus()
+  await waitFor(() => expect(modifyButton).toHaveFocus())
   await user.click(modifyButton)
   expect(screen.getByLabelText("Event name")).toHaveValue("Final project")
 })
@@ -226,6 +235,46 @@ test("explains why Terra replaced the Luna extraction", () => {
   expect(screen.getByText("Terra repaired Low Confidence and Source Mismatch")).toBeInTheDocument()
 })
 
+test("shows a compact syllabus typo note and hides legacy Terra repair details", () => {
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_type: "class",
+        title: "No Lecture / Friday schedule",
+        event_date: "2025-11-27",
+        warning_codes: ["DATE_CONFLICT"],
+        warning_reason:
+          "Syllabus typo. The written date and weekday do not match. The numeric date was kept.",
+        extraction_model: "gpt-5.6-terra",
+        fallback_reason_codes: ["DATE_CONFLICT"],
+        derivation_summary: "Legacy explanation that should stay hidden.",
+      }}
+      onSave={vi.fn()}
+      {...defaultProps}
+    />,
+  )
+
+  expect(screen.getByText("Syllabus typo")).toBeInTheDocument()
+  expect(
+    screen.getByText(
+      "Syllabus typo. The written date and weekday do not match. The numeric date was kept.",
+    ),
+  ).toBeInTheDocument()
+  expect(screen.queryByText("Needs attention")).not.toBeInTheDocument()
+  expect(screen.queryByText("Terra repaired Date Conflict")).not.toBeInTheDocument()
+  expect(screen.queryByText("Calculated date")).not.toBeInTheDocument()
+  expect(screen.queryByText("Legacy explanation that should stay hidden.")).not.toBeInTheDocument()
+  expect(screen.getByText("Syllabus says").closest("div")?.parentElement).toHaveAttribute(
+    "aria-describedby",
+    expect.stringMatching(/^:?.+/),
+  )
+  expect(screen.getByText("AI date").closest("div")).not.toHaveAttribute("aria-describedby")
+  expect(screen.getByText("AI date").closest("div")).not.toHaveAttribute("data-focus-target")
+  expect(screen.getByText("November 27, 2025")).not.toHaveClass("text-warning")
+  expect(screen.getByText("AI date").closest("div")).not.toHaveAttribute("tabindex")
+})
+
 test("shows a save error next to the review actions", async () => {
   const user = userEvent.setup()
   const onSave = vi.fn().mockRejectedValue(new Error("The event could not be saved."))
@@ -236,7 +285,7 @@ test("shows a save error next to the review actions", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("The event could not be saved.")
 })
 
-test("shows a date error and still lets an undated event be saved for later", async () => {
+test("lets an undated event be saved for later from the closed state", async () => {
   const user = userEvent.setup()
   const onSave = vi.fn().mockResolvedValue(undefined)
   const undatedEvent = {
@@ -247,17 +296,8 @@ test("shows a date error and still lets an undated event be saved for later", as
   }
   render(<ReviewEventCard event={undatedEvent} onSave={onSave} {...defaultProps} />)
 
-  await user.click(screen.getByRole("button", { name: "Confirm" }))
-  const dateField = screen.getByLabelText("Event date")
-  expect(dateField).toHaveValue("")
-  expect(await screen.findByRole("alert")).toHaveTextContent("Add a date before confirming this event.")
-  expect(dateField.closest('[data-review-field="event-date"]')).toHaveTextContent(
-    "Add a date before confirming this event.",
-  )
-  expect(dateField).toHaveAttribute("aria-describedby", expect.stringContaining("review-error"))
-  expect(screen.getAllByText("Add a date before confirming this event.")).toHaveLength(1)
-
-  await user.click(screen.getByRole("button", { name: "Keep pending" }))
+  expect(screen.queryByRole("button", { name: "Confirm" })).not.toBeInTheDocument()
+  await user.click(screen.getByRole("button", { name: "Save for later" }))
 
   expect(onSave).toHaveBeenCalledWith("event-1", {
     title: "Final project",
@@ -268,6 +308,212 @@ test("shows a date error and still lets an undated event be saved for later", as
     is_all_day: true,
     review_status: "pending",
   })
+})
+
+test("shows Save for later in the editor for undated needs review events and closes after saving", async () => {
+  const user = userEvent.setup()
+  const onSave = vi.fn().mockResolvedValue(undefined)
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        warning_codes: ["DATE_MISSING"],
+        warning_reason: "The event does not have a confirmed date.",
+      }}
+      onSave={onSave}
+      startEditing
+      {...defaultProps}
+    />,
+  )
+
+  const saveForLaterButton = await screen.findByRole("button", { name: "Save for later" })
+  expect(saveForLaterButton).toBeInTheDocument()
+  expect(screen.queryByRole("button", { name: "Save and confirm" })).not.toBeInTheDocument()
+
+  await user.clear(screen.getByLabelText("Event name"))
+  await user.type(screen.getByLabelText("Event name"), "Final project follow-up")
+  await user.click(saveForLaterButton)
+
+  expect(onSave).toHaveBeenCalledWith("event-1", {
+    title: "Final project follow-up",
+    event_type: "project",
+    event_date: null,
+    start_time: null,
+    end_time: null,
+    is_all_day: true,
+    review_status: "pending",
+  })
+  expect(screen.queryByLabelText("Event name")).not.toBeInTheDocument()
+})
+
+test("disables Save for later and shows loading copy while the editor save is pending", async () => {
+  const user = userEvent.setup()
+  const saveRequest = createDeferredPromise()
+  const onSave = vi.fn().mockReturnValue(saveRequest.promise)
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        warning_codes: ["DATE_MISSING"],
+        warning_reason: "The event does not have a confirmed date.",
+      }}
+      onSave={onSave}
+      startEditing
+      {...defaultProps}
+    />,
+  )
+
+  await user.click(await screen.findByRole("button", { name: "Save for later" }))
+
+  const loadingButton = screen.getByRole("button", { name: "Save for later" })
+  expect(loadingButton).toBeDisabled()
+  expect(loadingButton).toHaveTextContent("Saving for later...")
+
+  saveRequest.resolve()
+
+  await waitFor(() => expect(screen.queryByLabelText("Event name")).not.toBeInTheDocument())
+})
+
+test("keeps undated drafts visible when Save for later fails", async () => {
+  const user = userEvent.setup()
+  const onSave = vi.fn().mockRejectedValue(new Error("Could not save for later. Try again."))
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        warning_codes: ["DATE_MISSING"],
+        warning_reason: "The event does not have a confirmed date.",
+      }}
+      onSave={onSave}
+      startEditing
+      {...defaultProps}
+    />,
+  )
+
+  await user.clear(screen.getByLabelText("Event name"))
+  await user.type(screen.getByLabelText("Event name"), "Draft that should stay")
+  await user.click(await screen.findByRole("button", { name: "Save for later" }))
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Could not save for later. Try again.")
+  expect(screen.getByLabelText("Event name")).toHaveValue("Draft that should stay")
+  expect(screen.getByRole("button", { name: "Save for later" })).toBeInTheDocument()
+})
+
+test("shows saved for later state for pending undated events and confirms after a date is added", async () => {
+  const user = userEvent.setup()
+  const onSave = vi.fn().mockResolvedValue(undefined)
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        warning_codes: ["DATE_MISSING"],
+        warning_reason: "The event does not have a confirmed date.",
+        review_status: "pending",
+      }}
+      onSave={onSave}
+      {...defaultProps}
+    />,
+  )
+
+  expect(screen.getByText("Pending date")).toBeInTheDocument()
+  expect(screen.getByText("Saved for later")).toBeInTheDocument()
+
+  await user.click(screen.getByRole("button", { name: "Add date" }))
+  await user.type(screen.getByLabelText("Event date"), "2026-12-12")
+  expect(await screen.findByRole("button", { name: "Save and confirm" })).toBeInTheDocument()
+  await user.click(screen.getByRole("button", { name: "Save and confirm" }))
+
+  expect(onSave).toHaveBeenCalledWith("event-1", {
+    title: "Final project",
+    event_type: "project",
+    event_date: "2026-12-12",
+    start_time: null,
+    end_time: null,
+    is_all_day: true,
+    review_status: "confirmed",
+  })
+})
+
+test("disables Save and confirm and shows loading copy while confirmation is pending", async () => {
+  const user = userEvent.setup()
+  const saveRequest = createDeferredPromise()
+  const onSave = vi.fn().mockReturnValue(saveRequest.promise)
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        warning_codes: ["DATE_MISSING"],
+        warning_reason: "The event does not have a confirmed date.",
+        review_status: "pending",
+      }}
+      onSave={onSave}
+      startEditing
+      {...defaultProps}
+    />,
+  )
+
+  await user.type(screen.getByLabelText("Event date"), "2026-12-12")
+  await user.click(screen.getByRole("button", { name: "Save and confirm" }))
+
+  const loadingButton = screen.getByRole("button", { name: "Save and confirm" })
+  expect(loadingButton).toBeDisabled()
+  expect(loadingButton).toHaveTextContent("Saving and confirming...")
+
+  saveRequest.resolve()
+
+  await waitFor(() => expect(screen.queryByLabelText("Event name")).not.toBeInTheDocument())
+})
+
+test("does not show saved for later pending controls for recurring series members", () => {
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        review_status: "pending",
+        recurring_series_id: "series-1",
+        warning_codes: [],
+        warning_reason: null,
+      }}
+      onSave={vi.fn()}
+      {...defaultProps}
+    />,
+  )
+
+  expect(screen.queryByText("Saved for later")).not.toBeInTheDocument()
+  expect(screen.queryByRole("button", { name: "Add date" })).not.toBeInTheDocument()
+  expect(screen.queryByRole("button", { name: "Save for later" })).not.toBeInTheDocument()
+})
+
+test("does not switch recurring series members into the ordinary undated editor flow", async () => {
+  const user = userEvent.setup()
+  render(
+    <ReviewEventCard
+      event={{
+        ...event,
+        event_date: null,
+        review_status: "needs_review",
+        recurring_series_id: "series-1",
+        warning_codes: ["DATE_MISSING"],
+        warning_reason: "The recurring instance still needs a date.",
+      }}
+      onSave={vi.fn()}
+      startEditing
+      {...defaultProps}
+    />,
+  )
+
+  expect(screen.getByRole("button", { name: "Save changes" })).toBeInTheDocument()
+  expect(screen.queryByRole("button", { name: "Save for later" })).not.toBeInTheDocument()
+
+  await user.clear(screen.getByLabelText("Event name"))
+  await user.type(screen.getByLabelText("Event name"), "Recurring quiz instance")
+  expect(screen.getByLabelText("Event name")).toHaveValue("Recurring quiz instance")
 })
 
 test("edits event type and times, then saves the full payload", async () => {
@@ -295,7 +541,7 @@ test("edits event type and times, then saves the full payload", async () => {
   await user.type(screen.getByLabelText("Start time"), "13:30")
   await user.clear(screen.getByLabelText("End time"))
   await user.type(screen.getByLabelText("End time"), "14:45")
-  await user.click(screen.getByRole("button", { name: "Keep pending" }))
+  await user.click(screen.getByRole("button", { name: "Save for later" }))
 
   expect(onSave).toHaveBeenCalledWith("event-1", {
     title: "Final project",

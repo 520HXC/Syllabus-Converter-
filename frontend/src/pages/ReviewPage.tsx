@@ -8,12 +8,14 @@ import {
   FileText,
   ListChecks,
   RefreshCw,
+  Repeat,
   RotateCcw,
 } from "lucide-react"
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom"
 
 import { AppShell } from "../components/AppShell"
 import { CourseReviewCard } from "../components/CourseReviewCard"
+import { CourseRuleCard } from "../components/CourseRuleCard"
 import { PdfViewer } from "../components/PdfViewer"
 import { ErrorState, LoadingState } from "../components/QueryState"
 import { ReviewCompletionState } from "../components/ReviewCompletionState"
@@ -22,7 +24,9 @@ import { RecurringSeriesCard } from "../components/RecurringSeriesCard"
 import { Button } from "../components/ui/Button"
 import { Card } from "../components/ui/Card"
 import { useApi } from "../lib/api"
+import { isAwaitingDate } from "../lib/awaitingDate"
 import { resolveCourseDisplayColor } from "../lib/courseColors"
+import { isCourseRule } from "../lib/courseRules"
 import { useAuth } from "../lib/auth"
 import { semesterQueryKey } from "../lib/queryKeys"
 import { getReviewAttentionTarget } from "../lib/review"
@@ -109,6 +113,7 @@ export function ReviewPage() {
   const [mobileTab, setMobileTab] = useState<"document" | "results">("results")
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
   const [showReviewed, setShowReviewed] = useState(false)
+  const [showSavedForLater, setShowSavedForLater] = useState(false)
   const [showRemoved, setShowRemoved] = useState(false)
   const [deepLinkNotice, setDeepLinkNotice] = useState<string | null>(null)
   const [handledEventId, setHandledEventId] = useState<string | null>(null)
@@ -184,9 +189,21 @@ export function ReviewPage() {
     const card = document.querySelector<HTMLElement>(`[data-review-event-id="${pendingFocusEventId}"]`)
     if (!card) return
     const frame = requestAnimationFrame(() => {
-      const targetType = getReviewAttentionTarget(
-        reviewEvents.find((event) => event.id === pendingFocusEventId)?.warning_codes ?? [],
-      )
+      const focusEvent = reviewEvents.find((event) => event.id === pendingFocusEventId)
+      const targetType =
+        focusEvent && isAwaitingDate(focusEvent)
+          ? "date"
+          : getReviewAttentionTarget(focusEvent?.warning_codes ?? [])
+      if (focusEvent && isCourseRule(focusEvent)) {
+        const target =
+          card.querySelector<HTMLElement>('button[aria-label^="Modify "]') ??
+          card.querySelector<HTMLElement>("button, [tabindex='-1']") ??
+          card
+        target.scrollIntoView({ behavior: "smooth", block: "center" })
+        target.focus()
+        setPendingFocusEventId(null)
+        return
+      }
       const preferredDateField = card.querySelector<HTMLElement>('input[aria-label="Event date"]')
       const preferredNameField = card.querySelector<HTMLElement>('input[aria-label="Event name"]')
       const target =
@@ -263,9 +280,12 @@ export function ReviewPage() {
     ]),
   )
   const courseById = new Map(reviewData.courses.map((course) => [course.id, course]))
-  const totalEvents = reviewData.events.length
+  const countableReviewEvents = reviewData.events.filter(
+    (event) => !(isCourseRule(event) && event.review_status === "confirmed"),
+  )
+  const totalEvents = countableReviewEvents.length
   const totalDecisionCount =
-    reviewData.events.filter((event) => !belongsToKnownSeries(event)).length + recurringSeries.length
+    countableReviewEvents.filter((event) => !belongsToKnownSeries(event)).length + recurringSeries.length
   const resolvedCount = totalDecisionCount - unresolvedCount
   const resolvedPercent = totalDecisionCount
     ? Math.round((resolvedCount / totalDecisionCount) * 100)
@@ -274,28 +294,52 @@ export function ReviewPage() {
   const courses = currentDocumentId
     ? reviewData.courses.filter((course) => course.document_id === currentDocumentId)
     : reviewData.courses
+  const deepLinkedSavedRuleId =
+    eventId && data.events.some((event) => event.id === eventId && isCourseRule(event) && event.review_status === "pending")
+      ? eventId
+      : null
   const eventsForDocument = currentDocumentId
     ? sortEvents(reviewData.events.filter((event) => event.document_id === currentDocumentId))
     : sortEvents(reviewData.events)
   const standaloneEvents = eventsForDocument.filter((event) => !belongsToKnownSeries(event))
+  const courseRules = sortEvents(
+    standaloneEvents.filter(
+      (event) =>
+        isCourseRule(event) &&
+        (event.review_status === "needs_review" || event.id === deepLinkedSavedRuleId),
+    ),
+  )
+  const standardStandaloneEvents = standaloneEvents.filter((event) => !isCourseRule(event))
   const seriesForDocument = recurringSeries.filter(
     (series) => !currentDocumentId || series.document_id === currentDocumentId,
   )
-  const activeEvents = standaloneEvents.filter(
+  const activeEvents = standardStandaloneEvents.filter(
     (event) =>
       event.review_status === "needs_review" && !optimisticRemovedEventIds.includes(event.id),
   )
   const activeGroups = groupEventsByCourse(activeEvents, courses)
-  const reviewedEvents = standaloneEvents.filter(
-    (event) => event.review_status === "pending" || event.review_status === "confirmed",
+  const reviewedEvents = standardStandaloneEvents.filter(
+    (event) =>
+      event.review_status === "confirmed" ||
+      (event.review_status === "pending" && !isAwaitingDate(event)),
   )
+  const savedForLaterEvents = standardStandaloneEvents.filter((event) => isAwaitingDate(event))
+  const savedForLaterPanelId = "saved-for-later-panel"
   const removedEvents = standaloneEvents.filter((event) => event.review_status === "ignored")
   const unresolvedEvents = sortEvents(unresolvedStandaloneEvents)
   const nextUnresolvedEvent = unresolvedEvents[0] ?? null
   const nextUnresolvedSeries = unresolvedSeries[0] ?? null
   const hasPendingEventAction = eventMutation.isPending || optimisticRemovedEventIds.length > 0
-  const confirmedCount = reviewData.events.filter((event) => event.review_status === "confirmed").length
-  const pendingCount = reviewData.events.filter((event) => event.review_status === "pending").length
+  const confirmedCount = reviewData.events.filter(
+    (event) => !isCourseRule(event) && event.review_status === "confirmed",
+  ).length
+  const savedForLaterCount = reviewData.events.filter(
+    (event) => !isCourseRule(event) && event.review_status === "pending",
+  ).length
+  const awaitingDateCount = reviewData.events.filter((event) => isAwaitingDate(event)).length
+  const savedRuleCount = reviewData.events.filter(
+    (event) => isCourseRule(event) && event.review_status === "pending",
+  ).length
   const removedCount = reviewData.events.filter((event) => event.review_status === "ignored").length
   const pageMode = getReviewPageMode({
     reviewCompletedAt: reviewData.semester.review_completed_at,
@@ -390,7 +434,8 @@ export function ReviewPage() {
   function jumpToEvent(event: ExtractedEvent | null) {
     if (!event) return
     if (event.document_id) setSelectedDocumentId(event.document_id)
-    setShowReviewed(event.review_status === "pending" || event.review_status === "confirmed")
+    setShowSavedForLater(isAwaitingDate(event))
+    setShowReviewed(event.review_status === "confirmed" || (event.review_status === "pending" && !isAwaitingDate(event)))
     setShowRemoved(event.review_status === "ignored")
     setMobileTab("results")
     setPendingFocusEventId(event.id)
@@ -516,9 +561,88 @@ export function ReviewPage() {
         )
       })}
 
-      {!activeEvents.length && !reviewedEvents.length && !removedEvents.length && !seriesForDocument.length ? (
+      {courseRules.length ? (
+        <section className="grid gap-3" data-testid="course-rules-section">
+          <Card className="border-border/80 bg-panel/95 p-4 shadow-panel">
+            <div className="flex items-start gap-3">
+              <span className="mt-1 grid size-10 place-items-center rounded-2xl bg-accent/10 text-accent">
+                <Repeat aria-hidden="true" className="size-4" />
+              </span>
+              <div className="min-w-0">
+                <h2 className="text-lg font-semibold text-text">Course rules</h2>
+                <p className="mt-1 text-sm text-text-muted">
+                  Save recurring policies separately when the syllabus describes a pattern instead of exact dates.
+                </p>
+              </div>
+            </div>
+          </Card>
+          {courseRules.map((event) => {
+            const course = courseById.get(event.course_id)
+            return (
+              <CourseRuleCard
+                courseColor={
+                  courseDisplayColors.get(event.course_id) ??
+                  resolveCourseDisplayColor(event.course_id, course?.color, resolvedTheme)
+                }
+                courseLabel={course?.code || course?.name || "Course"}
+                event={event}
+                key={event.id}
+                onSave={saveEvent}
+              />
+            )
+          })}
+        </section>
+      ) : null}
+
+      {!activeEvents.length &&
+      !reviewedEvents.length &&
+      !savedForLaterEvents.length &&
+      !removedEvents.length &&
+      !seriesForDocument.length &&
+      !courseRules.length ? (
         <Card className="border-warning-border bg-warning-soft p-5 text-sm text-warning">
           No calendar events were found in this file. Check the PDF before finishing review.
+        </Card>
+      ) : null}
+
+      {savedForLaterEvents.length ? (
+        <Card className="overflow-hidden border-border/80 bg-panel/95">
+          <button
+            aria-expanded={showSavedForLater}
+            aria-controls={savedForLaterPanelId}
+            className="flex min-h-11 w-full items-center justify-between px-4 py-3 text-left text-sm font-semibold text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app"
+            onClick={() => setShowSavedForLater((current) => !current)}
+            type="button"
+          >
+            <span>Saved for later ({savedForLaterEvents.length})</span>
+            <ChevronDown
+              aria-hidden="true"
+              className={cn(
+                "size-4 transition-transform motion-reduce:transition-none",
+                showSavedForLater && "rotate-180",
+              )}
+            />
+          </button>
+          {showSavedForLater ? (
+            <div className="grid gap-4 border-t border-border/80 p-4" id={savedForLaterPanelId}>
+              {savedForLaterEvents.map((event) => {
+                const course = courseById.get(event.course_id)
+                return (
+                  <ReviewEventCard
+                    key={event.id}
+                    courseColor={
+                      courseDisplayColors.get(event.course_id) ??
+                      resolveCourseDisplayColor(event.course_id, course?.color, resolvedTheme)
+                    }
+                    courseLabel={course?.code || course?.name || "Course"}
+                    event={event}
+                    onSave={saveEvent}
+                    startEditing={pendingFocusEventId === event.id}
+                  />
+                )
+              })}
+            </div>
+          ) : null}
         </Card>
       ) : null}
 
@@ -614,11 +738,13 @@ export function ReviewPage() {
     return (
       <AppShell>
         <ReviewCompletionState
+          awaitingDateCount={awaitingDateCount}
           confirmedCount={confirmedCount}
           onOpenCalendar={() => navigate("/calendar")}
           onReviewDecisions={() => navigate("/review?mode=edit")}
-          pendingCount={pendingCount}
           removedCount={removedCount}
+          savedForLaterCount={savedForLaterCount}
+          savedRuleCount={savedRuleCount}
           semesterName={reviewData.semester.name}
         />
       </AppShell>
@@ -654,7 +780,7 @@ export function ReviewPage() {
                 {`${unresolvedCount} of ${totalDecisionCount} decisions left`}
               </h1>
               <p className="text-sm text-text-muted">
-                Review AI suggestions, keep tentative items pending, and publish only the events you trust.
+                Review AI suggestions, save undated items for later, and publish only the events you trust.
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-3 text-sm font-medium text-text-muted">
@@ -835,7 +961,7 @@ export function ReviewPage() {
               <p className="mt-0.5 hidden text-sm text-text-muted sm:block">
                 {pageMode === "editing"
                   ? "Saved decisions are open for changes until you return to the completed page."
-                  : "Pending items stay out of the calendar until you confirm them."}
+                  : "Saved for later items stay off the calendar until you confirm them."}
               </p>
             </div>
           </div>

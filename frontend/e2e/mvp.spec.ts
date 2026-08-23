@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test"
 import { readFile } from "node:fs/promises"
 
+const E2E_API_URL = "http://127.0.0.1:8010/api"
+const DEMO_USER_ID = "11111111-1111-4111-8111-111111111111"
+
 async function signIn(page: import("@playwright/test").Page) {
   await page.goto("/")
   const demoButton = page.getByRole("button", { name: "Try the local demo" })
@@ -72,6 +75,34 @@ async function uploadSyllabi(page: import("@playwright/test").Page) {
     },
   ])
   await page.getByRole("button", { name: "Process 2 syllabi" }).click()
+}
+
+async function makeExtractedEventUndated(
+  page: import("@playwright/test").Page,
+  semesterName: string,
+  eventTitle: string,
+) {
+  const headers = { Authorization: `Bearer ${DEMO_USER_ID}` }
+  const semestersResponse = await page.request.get(`${E2E_API_URL}/semesters`, { headers })
+  expect(semestersResponse.ok()).toBe(true)
+  const semesters = await semestersResponse.json() as Array<{ id: string; name: string }>
+  const semester = semesters.find((item) => item.name === semesterName)
+  expect(semester).toBeDefined()
+
+  const reviewResponse = await page.request.get(
+    `${E2E_API_URL}/semesters/${semester!.id}/review`,
+    { headers },
+  )
+  expect(reviewResponse.ok()).toBe(true)
+  const review = await reviewResponse.json() as { events: Array<{ id: string; title: string }> }
+  const event = review.events.find((item) => item.title === eventTitle)
+  expect(event).toBeDefined()
+
+  const updateResponse = await page.request.patch(`${E2E_API_URL}/extracted-events/${event!.id}`, {
+    headers,
+    data: { event_date: null },
+  })
+  expect(updateResponse.ok()).toBe(true)
 }
 
 test("applies the LifeTrack palette only when dark mode is resolved", async ({ page }) => {
@@ -147,6 +178,7 @@ test("isolates review flow across documents and keeps the sticky footer clear at
 
   await expect(page).toHaveURL(/\/processing$/)
   await expect(page.getByText("Ready for review").first()).toBeVisible({ timeout: 15_000 })
+  await makeExtractedEventUndated(page, "Fall 2026", "Final project")
   await page.getByRole("button", { name: "Review details" }).click()
 
   await expect(page).toHaveURL(/\/review$/)
@@ -174,6 +206,7 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   await expect(page.getByRole("heading", { name: "Final project" })).toBeVisible()
   await expect(page.getByLabel("Event date")).toBeFocused()
 
+  await page.getByRole("button", { name: "Cancel" }).click()
   await page.getByRole("button", { name: "Remove", exact: true }).click()
   await expect(page.getByText("Event removed.")).toBeVisible()
   await expect(page.getByRole("button", { name: /Removed events \(1\)/i })).toBeVisible()
@@ -183,24 +216,29 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   await expect(page.getByRole("heading", { name: "Final project" })).toBeVisible()
   await page.reload()
   await expect(page.getByRole("heading", { name: "Final project" })).toBeVisible()
-  await page.getByRole("button", { name: "Keep pending", exact: true }).click()
+  await page.getByRole("button", { name: "Save for later", exact: true }).click()
   await expect(page.getByRole("button", { name: "Finish and open Calendar" })).toBeVisible()
   await page.reload()
   await expect(page.getByRole("button", { name: "Finish and open Calendar" })).toBeVisible()
-  await page.getByRole("button", { name: /Reviewed events \(1\)/i }).click()
+  await page.getByRole("button", { name: /Saved for later \(1\)/i }).click()
   const pendingCard = page.locator("[data-review-event-id]").filter({ hasText: "Final project" })
-  await expect(pendingCard.getByText("Pending", { exact: true })).toBeVisible()
+  await expect(pendingCard.getByText("Pending date", { exact: true })).toBeVisible()
+  await expect(pendingCard.getByText("Saved for later", { exact: true })).toBeVisible()
 
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
   const footerBox = await page.getByRole("button", { name: "Finish and open Calendar" }).boundingBox()
   const stickyFooterBox = await page.getByTestId("review-sticky-footer").boundingBox()
   const mobileNavigationBox = await page.getByRole("navigation", { name: "Mobile navigation" }).boundingBox()
-  const reviewedSectionBox = await page.getByRole("button", { name: /Reviewed events \(1\)/i }).boundingBox()
+  const savedForLaterSectionBox = await page
+    .getByRole("button", { name: /Saved for later \(1\)/i })
+    .boundingBox()
   expect(footerBox).not.toBeNull()
   expect(stickyFooterBox).not.toBeNull()
   expect(mobileNavigationBox).not.toBeNull()
-  expect(reviewedSectionBox).not.toBeNull()
-  expect((reviewedSectionBox?.y ?? 0) + (reviewedSectionBox?.height ?? 0)).toBeLessThanOrEqual(footerBox?.y ?? 0)
+  expect(savedForLaterSectionBox).not.toBeNull()
+  expect((savedForLaterSectionBox?.y ?? 0) + (savedForLaterSectionBox?.height ?? 0)).toBeLessThanOrEqual(
+    footerBox?.y ?? 0,
+  )
   expect((stickyFooterBox?.y ?? 0) + (stickyFooterBox?.height ?? 0)).toBeLessThanOrEqual(
     mobileNavigationBox?.y ?? 0,
   )
@@ -209,7 +247,8 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   await expect(page).toHaveURL(/\/calendar\?view=list$/)
   await expect(page.getByRole("navigation", { name: "Setup progress" })).toHaveCount(0)
   await expect(page.getByRole("button", { name: "List", exact: true })).toHaveAttribute("aria-pressed", "true")
-  await expect(page.getByRole("button", { name: /Final project/i })).toBeVisible()
+  await expect(page.getByRole("heading", { name: "Awaiting dates" })).toBeVisible()
+  await expect(page.getByRole("link", { name: /Final project/i })).toBeVisible()
   await expect(page.getByRole("link", { name: /Midterm/i })).toBeVisible()
   await expect
     .poll(() => page.evaluate(() => ({
@@ -270,7 +309,8 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   await expect(page.getByRole("button", { name: "Open Calendar" })).toBeVisible()
   await expect(page.getByRole("button", { name: "Review decisions" })).toBeVisible()
   await expect(page.getByText("Confirmed", { exact: true })).toBeVisible()
-  await expect(page.getByText("Pending", { exact: true })).toBeVisible()
+  await expect(page.getByText("Saved for later", { exact: true })).toBeVisible()
+  await expect(page.getByText("Saved rules", { exact: true })).toBeVisible()
   await expect(page.getByText("Removed", { exact: true })).toBeVisible()
   await expect(page.getByText("Previewing")).toHaveCount(0)
 
@@ -291,17 +331,20 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   await page.getByRole("button", { name: "Open Calendar" }).click()
   await expect(page).toHaveURL(/\/calendar\?view=list$/)
 
-  await page.getByRole("button", { name: /Final project/i }).click()
+  await page.getByRole("link", { name: /Final project/i }).click()
   await expect(page).toHaveURL(/\/review\?eventId=[^&]+$/)
   await expect(page.getByRole("heading", { name: "Final project" })).toBeVisible()
   await expect(page.getByLabel("Event date")).toBeFocused()
   await expect(page.getByTestId("review-sticky-footer")).toBeHidden()
-  await page.getByRole("button", { name: "Cancel" }).click()
-  await expect(page.getByRole("button", { name: "Done editing" })).toBeVisible()
+  await page.getByLabel("Event date").fill("2026-12-10")
+  await page.getByRole("button", { name: "Save and confirm" }).click()
+  await expect(page.getByRole("button", { name: /Reviewed events \(1\)/i })).toBeVisible()
 
   await page.goBack()
   await expect(page).toHaveURL(/\/calendar\?view=list$/)
   await expect(page.getByRole("button", { name: "List", exact: true })).toHaveAttribute("aria-pressed", "true")
+  await expect(page.getByRole("heading", { name: "Awaiting dates" })).toHaveCount(0)
+  await expect(page.getByRole("link", { name: /Final project/i })).toBeVisible()
 
   await page.getByRole("button", { name: "Month", exact: true }).click()
   await expect(page).toHaveURL(/\/calendar\?view=month$/)
@@ -324,7 +367,7 @@ test("isolates review flow across documents and keeps the sticky footer clear at
   expect(path).not.toBeNull()
   const ics = await readFile(path!, "utf8")
   expect(ics).toContain("Midterm exam")
-  expect(ics).not.toContain("Final project")
+  expect(ics).toContain("Final project")
 })
 
 test("reviews a recurring schedule once while preserving individual changes", async ({ page }) => {

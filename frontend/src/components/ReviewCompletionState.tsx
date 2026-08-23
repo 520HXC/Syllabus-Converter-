@@ -10,12 +10,12 @@ function SummaryStat({
 }: {
   label: string
   value: number
-  tone: "confirmed" | "pending" | "removed"
+  tone: "confirmed" | "saved" | "removed"
 }) {
   const toneClassName =
     tone === "confirmed"
       ? "border-accent/20 bg-accent/10 text-accent"
-      : tone === "pending"
+      : tone === "saved"
         ? "border-warning-border bg-warning-soft text-warning"
         : "border-border/80 bg-panel-muted/50 text-text-muted"
 
@@ -30,14 +30,18 @@ function SummaryStat({
 export function ReviewCompletionState({
   semesterName,
   confirmedCount,
-  pendingCount,
+  savedForLaterCount,
+  awaitingDateCount,
+  savedRuleCount,
   removedCount,
   onOpenCalendar,
   onReviewDecisions,
 }: {
   semesterName: string
   confirmedCount: number
-  pendingCount: number
+  savedForLaterCount: number
+  awaitingDateCount: number
+  savedRuleCount: number
   removedCount: number
   onOpenCalendar: () => void
   onReviewDecisions: () => void
@@ -55,16 +59,24 @@ export function ReviewCompletionState({
               Every decision for {semesterName} is saved
             </h1>
             <p className="max-w-2xl text-sm leading-6 text-text-muted">
-              Open Calendar to see confirmed events in context, or review decisions to adjust confirmed, pending, and removed items.
+              Open Calendar to see confirmed events in context, or review decisions to adjust confirmed events, saved items, and removed items.
             </p>
           </div>
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-4">
           <SummaryStat label="Confirmed" tone="confirmed" value={confirmedCount} />
-          <SummaryStat label="Pending" tone="pending" value={pendingCount} />
+          <SummaryStat label="Saved for later" tone="saved" value={savedForLaterCount} />
+          <SummaryStat label="Saved rules" tone="saved" value={savedRuleCount} />
           <SummaryStat label="Removed" tone="removed" value={removedCount} />
         </div>
+
+        <p className="text-sm leading-6 text-text-muted">
+          Saved for later items stay off the calendar until you confirm them. Saved rules stay as reference details and do not enter the calendar until the syllabus gives you exact dates to confirm.
+          {awaitingDateCount > 0
+            ? ` ${awaitingDateCount} item${awaitingDateCount === 1 ? "" : "s"} still ${awaitingDateCount === 1 ? "needs" : "need"} a date.`
+            : ""}
+        </p>
 
         <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
           <Button onClick={onOpenCalendar} type="button">

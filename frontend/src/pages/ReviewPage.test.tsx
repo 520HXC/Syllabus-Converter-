@@ -723,6 +723,82 @@ test("eventId query selects the correct document, opens the reviewed group, and 
   await waitFor(() => expect(within(quizCard as HTMLElement).getByDisplayValue("Quiz 1")).toHaveFocus())
 })
 
+test("pending undated standard events move into Saved for later and do not block finishing review", async () => {
+  reviewState.events = [
+    {
+      ...reviewState.events[0],
+      id: "event-awaiting-date",
+      title: "Final project",
+      event_date: null,
+      warning_codes: ["DATE_MISSING"],
+      warning_reason: "The event does not have a confirmed date.",
+      review_status: "pending",
+    },
+    {
+      ...reviewState.events[1],
+      id: "event-confirmed-1",
+      review_status: "confirmed",
+    },
+    {
+      ...reviewState.events[2],
+      id: "event-confirmed-2",
+      review_status: "confirmed",
+    },
+  ]
+
+  renderReviewPage()
+
+  expect(await screen.findByRole("heading", { name: "0 of 3 decisions left" })).toBeInTheDocument()
+  const savedForLaterButton = screen.getByRole("button", { name: /Saved for later/i })
+  expect(savedForLaterButton).toHaveTextContent("1")
+  expect(savedForLaterButton).toHaveAttribute("aria-controls", "saved-for-later-panel")
+  expect(screen.getByRole("button", { name: /Reviewed events/i })).toHaveTextContent("1")
+  expect(screen.getByRole("button", { name: "Finish and open Calendar" })).toBeInTheDocument()
+  expect(
+    screen.getByText("Saved for later items stay off the calendar until you confirm them."),
+  ).toBeInTheDocument()
+
+  await userEvent.setup().click(savedForLaterButton)
+  const savedForLaterPanel = document.getElementById("saved-for-later-panel")
+  expect(savedForLaterPanel).not.toBeNull()
+  expect(savedForLaterButton).toHaveAttribute("aria-expanded", "true")
+  expect(screen.getByText("Final project")).toBeInTheDocument()
+})
+
+test("eventId query focuses the date field for pending undated events without warning codes", async () => {
+  reviewState.events = [
+    {
+      ...reviewState.events[0],
+      id: "event-awaiting-date",
+      course_id: "course-2",
+      document_id: "document-2",
+      title: "Quiz 1",
+      event_date: null,
+      warning_codes: [],
+      warning_reason: null,
+      review_status: "pending",
+    },
+    {
+      ...reviewState.events[1],
+      id: "event-confirmed-1",
+      review_status: "confirmed",
+    },
+    {
+      ...reviewState.events[2],
+      id: "event-confirmed-2",
+      review_status: "confirmed",
+    },
+  ]
+
+  renderReviewPage("/review?eventId=event-awaiting-date")
+
+  expect(await screen.findByText("Previewing math201.pdf")).toBeInTheDocument()
+  expect(screen.getByRole("button", { name: /Saved for later/i })).toHaveAttribute("aria-expanded", "true")
+  const awaitingCard = screen.getByText("Quiz 1").closest("[data-review-event-id]")
+  expect(awaitingCard).not.toBeNull()
+  await waitFor(() => expect(within(awaitingCard as HTMLElement).getByLabelText("Event date")).toHaveFocus())
+})
+
 test("revisiting the same eventId after clearing the query focuses it again", async () => {
   const user = userEvent.setup()
   const queryClient = new QueryClient({
@@ -757,17 +833,59 @@ test("invalid eventId shows a notice and falls back to the first unresolved bloc
   await waitFor(() => expect(within(workshopCard as HTMLElement).getByLabelText("Event date")).toHaveFocus())
 })
 
-test("shows a completed state for the plain review route and hides the old workspace", async () => {
+test("shows the completed review summary with confirmed, saved for later, saved rules, and removed counts", async () => {
   reviewState.semester.review_completed_at = "2026-08-14T15:00:00Z"
-  reviewState.events[0].review_status = "confirmed"
-  reviewState.events[1].review_status = "pending"
+  reviewState.events = [
+    {
+      ...reviewState.events[0],
+      id: "event-confirmed",
+      title: "Final project",
+      review_status: "confirmed",
+      warning_codes: [],
+      warning_reason: null,
+    },
+    {
+      ...reviewState.events[1],
+      id: "event-awaiting-date",
+      title: "Final exam",
+      event_date: null,
+      warning_codes: ["DATE_MISSING"],
+      warning_reason: "The event does not have a confirmed date.",
+      review_status: "pending",
+    },
+    {
+      ...reviewState.events[2],
+      id: "course-rule-saved",
+      title: "Weekly reading cadence",
+      event_date: null,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      warning_reason: null,
+      derivation_summary: "The syllabus names the rule, but not every lecture date.",
+      review_status: "pending",
+    },
+    {
+      ...reviewState.events[2],
+      id: "event-removed",
+      title: "Removed workshop",
+      review_status: "ignored",
+    },
+  ]
   renderReviewPage()
 
   expect(await screen.findByText("Review complete")).toBeInTheDocument()
   expect(screen.getByRole("heading", { name: "Every decision for Fall 2026 is saved" })).toBeInTheDocument()
-  expect(screen.getByText("Confirmed")).toBeInTheDocument()
-  expect(screen.getByText("Pending")).toBeInTheDocument()
-  expect(screen.getByText("Removed")).toBeInTheDocument()
+  expect(screen.getByText("Confirmed").parentElement).toHaveTextContent("1")
+  expect(screen.getByText("Saved for later").parentElement).toHaveTextContent("1")
+  expect(screen.getByText("Saved rules").parentElement).toHaveTextContent("1")
+  expect(screen.getByText("Removed").parentElement).toHaveTextContent("1")
+  expect(screen.queryByText("Pending")).not.toBeInTheDocument()
+  expect(
+    screen.getByText(/Saved for later items stay off the calendar until you confirm them\./i),
+  ).toBeInTheDocument()
+  expect(
+    screen.getByText(/Saved rules stay as reference details and do not enter the calendar until the syllabus gives you exact dates to confirm\./i),
+  ).toBeInTheDocument()
+  expect(screen.getByText(/1 item still needs a date\./i)).toBeInTheDocument()
   expect(screen.getByRole("button", { name: "Open Calendar" })).toBeInTheDocument()
   expect(screen.getByRole("button", { name: "Review decisions" })).toBeInTheDocument()
   expect(screen.queryByText(/Previewing cs101\.pdf/i)).not.toBeInTheDocument()
@@ -919,7 +1037,7 @@ test("completed editing removes pending items from the calendar cache immediatel
   const finalProjectCard = await screen.findByText("Final project").then((element) => element.closest("[data-review-event-id]"))
   expect(finalProjectCard).not.toBeNull()
 
-  await user.click(within(finalProjectCard as HTMLElement).getByRole("button", { name: "Keep pending" }))
+  await user.click(within(finalProjectCard as HTMLElement).getByRole("button", { name: "Save for later" }))
 
   await waitFor(() => expect(updateEventMock).toHaveBeenCalledWith("event-1", expect.objectContaining({ review_status: "pending" })))
   await waitFor(() =>
@@ -928,4 +1046,155 @@ test("completed editing removes pending items from the calendar cache immediatel
     ).not.toContain("event-1"),
   )
   expect(invalidateQueries).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["events", "semester-1"] }))
+})
+
+test("shows only unresolved course rules in the default workspace and keeps saved rules out of event groups", async () => {
+  reviewState.events[0] = {
+    ...reviewState.events[0],
+    id: "course-rule-needs-review",
+    title: "Quick Checks",
+    event_type: "quiz",
+    event_date: null,
+    warning_codes: ["AMBIGUOUS_RECURRENCE"],
+    warning_reason: null,
+    derivation_summary: "The syllabus names the rule, but not every lecture date.",
+    review_status: "needs_review",
+  }
+  reviewState.events.push({
+    ...reviewState.events[0],
+    id: "course-rule-saved",
+    title: "Attendance policy",
+    event_type: "class",
+    source_quote: "Attendance is required for every lecture",
+    source_page: 4,
+    review_status: "pending",
+  })
+  reviewState.events.push({
+    ...reviewState.events[0],
+    id: "course-rule-confirmed",
+    title: "Legacy confirmed rule",
+    source_quote: "Legacy course rule that should not render here",
+    source_page: 6,
+    review_status: "confirmed",
+  })
+  reviewState.events.push({
+    ...reviewState.events[0],
+    id: "course-rule-ignored",
+    title: "Removed course rule",
+    source_quote: "Removed course rule should stay out of the active group",
+    source_page: 7,
+    review_status: "ignored",
+  })
+  reviewState.events[1].review_status = "confirmed"
+
+  renderReviewPage()
+
+  expect(await screen.findByRole("heading", { name: "1 of 5 decisions left" })).toBeInTheDocument()
+  expect(screen.getByText("5 extracted events")).toBeInTheDocument()
+  const section = await screen.findByTestId("course-rules-section")
+  expect(within(section).getByText("Quick Checks")).toBeInTheDocument()
+  expect(within(section).queryByText("Attendance policy")).not.toBeInTheDocument()
+  expect(within(section).queryByText("Legacy confirmed rule")).not.toBeInTheDocument()
+  expect(within(section).queryByText("Removed course rule")).not.toBeInTheDocument()
+  expect(screen.getByRole("button", { name: /Reviewed events/i })).toHaveTextContent("1")
+  expect(screen.getByRole("button", { name: /Removed events/i })).toHaveTextContent("1")
+  expect(screen.getByRole("button", { name: "Review next" })).toBeInTheDocument()
+  expect(screen.queryByRole("button", { name: "Finish and open Calendar" })).not.toBeInTheDocument()
+})
+
+test("saving a course rule resolves the blocker and keeps the saved rule out of the default workspace", async () => {
+  const user = userEvent.setup()
+  reviewState.events = [
+    {
+      ...reviewState.events[0],
+      id: "course-rule-1",
+      course_id: "course-2",
+      document_id: "document-2",
+      title: "Quick Checks",
+      event_type: "quiz",
+      event_date: null,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      warning_reason: null,
+      derivation_summary: "The syllabus names the rule, but not every lecture date.",
+      review_status: "needs_review",
+    },
+    {
+      ...reviewState.events[1],
+      id: "event-confirmed-1",
+      document_id: "document-1",
+      review_status: "confirmed",
+      warning_codes: [],
+      warning_reason: null,
+    },
+    {
+      ...reviewState.events[2],
+      id: "event-confirmed-2",
+      review_status: "confirmed",
+    },
+  ]
+
+  renderReviewPage("/review?eventId=course-rule-1")
+
+  expect(await screen.findByText("Previewing math201.pdf")).toBeInTheDocument()
+  const ruleCard = await screen.findByText("Quick Checks").then((element) => element.closest("[data-review-event-id]"))
+  expect(ruleCard).not.toBeNull()
+  await waitFor(() =>
+    expect(within(ruleCard as HTMLElement).getByRole("button", { name: "Modify Quick Checks" })).toHaveFocus(),
+  )
+  expect(within(ruleCard as HTMLElement).queryByLabelText("Event date")).not.toBeInTheDocument()
+
+  await user.click(within(ruleCard as HTMLElement).getByRole("button", { name: "Save course rule" }))
+
+  await waitFor(() =>
+    expect(updateEventMock).toHaveBeenCalledWith(
+      "course-rule-1",
+      expect.objectContaining({ review_status: "pending" }),
+    ),
+  )
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Done editing" })).toBeInTheDocument(),
+  )
+
+  await user.click(screen.getByRole("button", { name: "Done editing" }))
+
+  expect(await screen.findByText("Previewing math201.pdf")).toBeInTheDocument()
+  expect(screen.getByRole("heading", { name: "0 of 3 decisions left" })).toBeInTheDocument()
+  expect(screen.getByRole("button", { name: "Finish and open Calendar" })).toBeInTheDocument()
+  expect(screen.queryByTestId("course-rules-section")).not.toBeInTheDocument()
+  expect(screen.queryByText("Quick Checks")).not.toBeInTheDocument()
+})
+
+test("saved course rules stay available when deep linked after review is complete", async () => {
+  reviewState.semester.review_completed_at = "2026-08-14T15:00:00Z"
+  reviewState.events = [
+    {
+      ...reviewState.events[0],
+      id: "course-rule-1",
+      course_id: "course-2",
+      document_id: "document-2",
+      title: "Quick Checks",
+      event_type: "quiz",
+      event_date: null,
+      warning_codes: ["AMBIGUOUS_RECURRENCE"],
+      warning_reason: null,
+      derivation_summary: "The syllabus names the rule, but not every lecture date.",
+      review_status: "pending",
+    },
+    {
+      ...reviewState.events[1],
+      id: "event-confirmed-1",
+      review_status: "confirmed",
+      warning_codes: [],
+      warning_reason: null,
+    },
+  ]
+
+  renderReviewPage("/review?eventId=course-rule-1")
+
+  expect(await screen.findByText("Previewing math201.pdf")).toBeInTheDocument()
+  const ruleCard = await screen.findByText("Quick Checks").then((element) => element.closest("[data-review-event-id]"))
+  expect(ruleCard).not.toBeNull()
+  expect(within(ruleCard as HTMLElement).getByText("Saved")).toBeInTheDocument()
+  expect(within(ruleCard as HTMLElement).queryByLabelText("Event date")).not.toBeInTheDocument()
+  expect(screen.getByRole("button", { name: "Done editing" })).toBeInTheDocument()
 })

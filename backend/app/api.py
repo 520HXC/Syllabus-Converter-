@@ -34,7 +34,7 @@ from .models import (
     Semester,
     SyllabusDocument,
 )
-from .processing import process_job
+from .processing import SYLLABUS_TYPO_WARNING, process_job, source_quote_has_weekday_typo
 from .schemas import (
     CourseRead,
     CourseUpdate,
@@ -62,6 +62,13 @@ def safe_filename(filename: str | None) -> str:
     return sanitized[:255] or "syllabus.pdf"
 
 
+def is_standalone_course_rule(event: ExtractedEvent) -> bool:
+    return (
+        "AMBIGUOUS_RECURRENCE" in (event.warning_codes or [])
+        and event.recurring_series_id is None
+    )
+
+
 def owned_semester(db: Session, semester_id: UUID, user_id: UUID) -> Semester:
     semester = db.scalar(
         select(Semester).where(Semester.id == semester_id, Semester.user_id == user_id)
@@ -71,8 +78,67 @@ def owned_semester(db: Session, semester_id: UUID, user_id: UUID) -> Semester:
     return semester
 
 
-def job_read(job: ProcessingJob) -> JobRead:
-    return JobRead.model_validate(job).model_copy(update={"filename": job.document.filename})
+def job_read(job: ProcessingJob, *, hide_syllabus_typo_fallback: bool = False) -> JobRead:
+    update: dict[str, object] = {"filename": job.document.filename}
+    if hide_syllabus_typo_fallback:
+        update.update({"fallback_used": False, "fallback_reason_codes": []})
+    return JobRead.model_validate(job).model_copy(update=update)
+
+
+def has_cross_event_date_conflict(
+    event: ExtractedEvent,
+    comparison_events: list[ExtractedEvent],
+) -> bool:
+    if event.event_date is None:
+        return False
+    normalized_title = re.sub(r"\s+", " ", event.title).strip().casefold()
+    return any(
+        other.id != event.id
+        and other.event_date is not None
+        and other.event_date != event.event_date
+        and re.sub(r"\s+", " ", other.title).strip().casefold() == normalized_title
+        for other in comparison_events
+    )
+
+
+def is_pure_syllabus_typo(
+    event: ExtractedEvent,
+    semester: Semester,
+    comparison_events: list[ExtractedEvent] | None = None,
+) -> bool:
+    warning_codes = set(event.warning_codes or [])
+    fallback_codes = set(event.fallback_reason_codes or [])
+    semester_events = comparison_events if comparison_events is not None else semester.events
+    return bool(
+        "DATE_CONFLICT" in warning_codes
+        and warning_codes <= {"DATE_CONFLICT", "YEAR_NOT_EXPLICIT", "MODEL_UNCERTAINTY"}
+        and fallback_codes <= {"DATE_CONFLICT"}
+        and not has_cross_event_date_conflict(event, semester_events)
+        and source_quote_has_weekday_typo(
+            event.source_quote,
+            event.event_date,
+            semester.start_date,
+            semester.end_date,
+        )
+    )
+
+
+def event_read(
+    event: ExtractedEvent,
+    semester: Semester,
+    comparison_events: list[ExtractedEvent] | None = None,
+) -> EventRead:
+    payload = EventRead.model_validate(event)
+    if not is_pure_syllabus_typo(event, semester, comparison_events):
+        return payload
+    return payload.model_copy(
+        update={
+            "warning_codes": ["DATE_CONFLICT"],
+            "warning_reason": SYLLABUS_TYPO_WARNING,
+            "fallback_reason_codes": [],
+            "derivation_summary": None,
+        }
+    )
 
 
 def dispatch_job(job_id: UUID, settings: Settings) -> None:
@@ -353,7 +419,7 @@ def list_jobs(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ) -> list[JobRead]:
-    owned_semester(db, semester_id, user.id)
+    semester = owned_semester(db, semester_id, user.id)
     jobs = db.scalars(
         select(ProcessingJob)
         .options(selectinload(ProcessingJob.document))
@@ -363,7 +429,35 @@ def list_jobs(
         )
         .order_by(ProcessingJob.created_at.asc())
     ).all()
-    return [job_read(job) for job in jobs]
+    events = list(
+        db.scalars(
+            select(ExtractedEvent).where(
+                ExtractedEvent.semester_id == semester_id,
+                ExtractedEvent.user_id == user.id,
+            )
+        )
+    )
+    events_by_document: dict[UUID, list[ExtractedEvent]] = {}
+    for event in events:
+        if event.document_id is not None:
+            events_by_document.setdefault(event.document_id, []).append(event)
+
+    payloads: list[JobRead] = []
+    for job in jobs:
+        related_events = events_by_document.get(job.document_id, [])
+        fallback_events = [event for event in related_events if event.fallback_reason_codes]
+        hide_syllabus_typo_fallback = bool(
+            set(job.fallback_reason_codes or []) == {"DATE_CONFLICT"}
+            and fallback_events
+            and all(
+                is_pure_syllabus_typo(event, semester, events)
+                for event in fallback_events
+            )
+        )
+        payloads.append(
+            job_read(job, hide_syllabus_typo_fallback=hide_syllabus_typo_fallback)
+        )
+    return payloads
 
 
 @router.post("/jobs/{job_id}/retry", response_model=JobRead)
@@ -489,7 +583,7 @@ def get_review(
         semester=semester,
         courses=courses,
         documents=documents,
-        events=events,
+        events=[event_read(event, semester, events) for event in events],
         recurring_series=recurring_series,
     )
 
@@ -500,7 +594,7 @@ def update_event(
     payload: EventUpdate,
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
-) -> ExtractedEvent:
+) -> EventRead:
     event = db.scalar(
         select(ExtractedEvent).where(
             ExtractedEvent.id == event_id,
@@ -509,18 +603,35 @@ def update_event(
     )
     if event is None:
         raise HTTPException(status_code=404, detail="Extracted event not found.")
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(event, field, value)
-    if event.review_status == ReviewStatus.CONFIRMED and event.event_date is None:
+    updates = payload.model_dump(exclude_unset=True)
+    next_review_status = updates.get("review_status", event.review_status)
+    next_event_date = updates.get("event_date", event.event_date)
+    next_is_all_day = updates.get("is_all_day", event.is_all_day)
+    next_start_time = updates.get("start_time", event.start_time)
+    next_end_time = updates.get("end_time", event.end_time)
+
+    if is_standalone_course_rule(event) and next_review_status == ReviewStatus.CONFIRMED:
+        raise HTTPException(
+            status_code=422,
+            detail="Course rules cannot be published as a single calendar event.",
+        )
+    if next_review_status == ReviewStatus.CONFIRMED and next_event_date is None:
         raise HTTPException(status_code=422, detail="Add a date before confirming this event.")
+    if next_is_all_day:
+        next_start_time = None
+        next_end_time = None
+    if next_start_time and next_end_time and next_end_time <= next_start_time:
+        raise HTTPException(status_code=422, detail="End time must be after start time.")
+
+    for field, value in updates.items():
+        setattr(event, field, value)
     if event.is_all_day:
         event.start_time = None
         event.end_time = None
-    if event.start_time and event.end_time and event.end_time <= event.start_time:
-        raise HTTPException(status_code=422, detail="End time must be after start time.")
+
     db.commit()
     db.refresh(event)
-    return event
+    return event_read(event, event.semester)
 
 
 @router.patch("/recurring-series/{series_id}", response_model=RecurringSeriesRead)
@@ -634,9 +745,9 @@ def list_confirmed_events(
     semester_id: UUID,
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
-) -> list[ExtractedEvent]:
-    owned_semester(db, semester_id, user.id)
-    return list(
+) -> list[EventRead]:
+    semester = owned_semester(db, semester_id, user.id)
+    events = list(
         db.scalars(
             select(ExtractedEvent)
             .where(
@@ -648,6 +759,11 @@ def list_confirmed_events(
             .order_by(ExtractedEvent.event_date.asc(), ExtractedEvent.title.asc())
         )
     )
+    return [
+        event_read(event, semester)
+        for event in events
+        if not is_standalone_course_rule(event)
+    ]
 
 
 @router.get("/semesters/{semester_id}/calendar.ics")
@@ -671,7 +787,9 @@ def download_calendar(
     )
     if course_id:
         query = query.where(ExtractedEvent.course_id.in_(course_id))
-    events = list(db.scalars(query))
+    events = [
+        event for event in db.scalars(query) if not is_standalone_course_rule(event)
+    ]
     filename = re.sub(r"[^a-z0-9]+", "-", semester.name.lower()).strip("-") or "semester"
     return Response(
         build_calendar(semester.name, events),

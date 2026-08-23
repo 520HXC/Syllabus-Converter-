@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   CalendarDays,
   Check,
+  ChevronDown,
   ChevronRight,
   Download,
   FileUp,
@@ -16,12 +17,15 @@ import {
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom"
 
 import { AppShell } from "../components/AppShell"
+import { CourseDetailsPanel } from "../components/CourseDetailsPanel"
 import { EventTypeBadge } from "../components/EventTypeBadge"
 import { ErrorState, LoadingState } from "../components/QueryState"
 import { Button } from "../components/ui/Button"
 import { Card } from "../components/ui/Card"
 import { useApi } from "../lib/api"
+import { isAwaitingDate } from "../lib/awaitingDate"
 import { resolveCourseDisplayColor } from "../lib/courseColors"
+import { isCourseRule } from "../lib/courseRules"
 import { useSemester } from "../lib/semester"
 import type { Course, ExtractedEvent, ReviewPayload } from "../lib/types"
 import { cn } from "../lib/utils"
@@ -154,6 +158,10 @@ function getReviewStatusLabel(status: ExtractedEvent["review_status"]) {
   return "Confirmed"
 }
 
+function isRuleNeedingReview(status: ExtractedEvent["review_status"]) {
+  return status === "needs_review" || status === "pending"
+}
+
 function CalendarEmptyState({ message }: { message: string }) {
   return (
     <Card className="border-border/80 bg-panel/95 p-6 sm:p-7" data-testid="calendar-empty-state">
@@ -172,6 +180,7 @@ export function CalendarPage() {
   const [selectedCourseIds, setSelectedCourseIds] = useState<Set<string>>(new Set())
   const [initializedCourseFiltersForSemester, setInitializedCourseFiltersForSemester] = useState<string | null>(null)
   const [expandedCourseColorId, setExpandedCourseColorId] = useState<string | null>(null)
+  const [expandedCourseDetailsId, setExpandedCourseDetailsId] = useState<string | null>(null)
   const [pendingCourseColorIds, setPendingCourseColorIds] = useState<Set<string>>(new Set())
   const [courseColorErrors, setCourseColorErrors] = useState<Record<string, string>>({})
   const [downloading, setDownloading] = useState(false)
@@ -317,11 +326,15 @@ export function CalendarPage() {
   const filteredCourseIds = [...selectedCourseIds]
   const hasSelectedCourses = selectedCourseIds.size > 0
   const exportDisabledReason = hasSelectedCourses ? null : "Select at least one course to export a filtered calendar."
-  const visibleEvents = (eventsQuery.data ?? []).filter((event) => selectedCourseIds.has(event.course_id))
-  const pendingItems = reviewEvents.filter(
+  const calendarEvents = eventsQuery.data ?? []
+  const visibleEvents = calendarEvents.filter((event) => selectedCourseIds.has(event.course_id))
+  const selectedReviewEvents = reviewEvents.filter((event) => selectedCourseIds.has(event.course_id))
+  const awaitingDates = selectedReviewEvents.filter((event) => isAwaitingDate(event))
+  const reviewQueue = selectedReviewEvents.filter(
     (event) =>
-      selectedCourseIds.has(event.course_id) &&
-      (event.review_status === "needs_review" || event.review_status === "pending"),
+      !isCourseRule(event) &&
+      !event.recurring_series_id &&
+      event.review_status === "needs_review",
   )
   const groupedEvents = groupEventsByDate(visibleEvents, courses)
   const timelineCourses = courses.filter((course) => selectedCourseIds.has(course.id))
@@ -375,6 +388,10 @@ export function CalendarPage() {
 
   function toggleCourseColorPalette(courseId: string) {
     setExpandedCourseColorId((current) => (current === courseId ? null : courseId))
+  }
+
+  function toggleCourseDetails(courseId: string) {
+    setExpandedCourseDetailsId((current) => (current === courseId ? null : courseId))
   }
 
   function handleCourseColorSelect(courseId: string, color: string) {
@@ -535,7 +552,7 @@ export function CalendarPage() {
             </Button>
           </div>
 
-          <div className="mt-5 grid gap-5 xl:grid-cols-[16rem_minmax(0,1fr)]">
+          <div className="mt-5 grid gap-5 xl:grid-cols-[20rem_minmax(0,1fr)]">
             <aside aria-label="Course filters" role="region">
               <Card className="border-border/80 bg-panel-muted/35 p-4">
                 <div className="flex items-center gap-2 font-semibold text-text">
@@ -548,15 +565,34 @@ export function CalendarPage() {
                 <div className="mt-4 grid gap-2">
                   {courses.map((course) => {
                     const courseLabel = course.code || course.name
-                    const checkboxId = `course-filter-checkbox-${course.id}`
+                    const detailsPanelId = `course-details-panel-${course.id}`
                     const courseColor = courseDisplayColors.get(course.id) ?? course.color
                     const courseColorError = courseColorErrors[course.id]
                     const isPickerOpen = expandedCourseColorId === course.id
                     const isSavingColor = pendingCourseColorIds.has(course.id)
+                    const isDetailsOpen = expandedCourseDetailsId === course.id
+                    const courseConfirmedCount = calendarEvents.filter(
+                      (event) => event.course_id === course.id,
+                    ).length
+                    const courseAwaitingDateCount = reviewEvents.filter(
+                      (event) => event.course_id === course.id && isAwaitingDate(event),
+                    ).length
+                    const courseSavedRuleCount = reviewEvents.filter(
+                      (event) =>
+                        event.course_id === course.id &&
+                        isCourseRule(event) &&
+                        event.review_status === "pending",
+                    ).length
+                    const courseRules = reviewEvents.filter(
+                      (event) =>
+                        event.course_id === course.id &&
+                        isCourseRule(event) &&
+                        isRuleNeedingReview(event.review_status),
+                    )
 
                     return (
                       <div
-                        className="rounded-2xl border border-transparent px-2 py-1 transition-colors hover:border-border hover:bg-panel"
+                        className="overflow-hidden rounded-2xl border border-transparent px-2 py-1 transition-colors hover:border-border hover:bg-panel"
                         data-course-filter-row-id={course.id}
                         data-testid={`course-filter-row-${course.id}`}
                         key={course.id}
@@ -619,17 +655,42 @@ export function CalendarPage() {
                             ) : null}
                           </div>
                           <div className="flex min-h-11 min-w-0 flex-1 items-center gap-3 rounded-2xl px-1 py-1 text-sm font-medium text-text-muted">
-                            <input
-                              aria-label={courseLabel}
-                              checked={selectedCourseIds.has(course.id)}
-                              className="size-4 accent-accent"
-                              id={checkboxId}
-                              onChange={() => toggleCourse(course.id)}
-                              type="checkbox"
-                            />
-                            <label className="min-w-0 flex-1 cursor-pointer" htmlFor={checkboxId}>
-                              <span className="block truncate">{courseLabel}</span>
+                            <label
+                              className="inline-flex min-h-11 min-w-11 shrink-0 cursor-pointer items-center justify-center rounded-2xl border border-border/80 bg-panel focus-within:ring-2 focus-within:ring-focus focus-within:ring-offset-2 focus-within:ring-offset-bg-app"
+                              data-testid={`course-filter-checkbox-hit-area-${course.id}`}
+                            >
+                              <input
+                                aria-label={courseLabel}
+                                checked={selectedCourseIds.has(course.id)}
+                                className="size-4 accent-accent"
+                                onChange={() => toggleCourse(course.id)}
+                                type="checkbox"
+                              />
                             </label>
+                            <button
+                              aria-label={courseLabel}
+                              aria-controls={detailsPanelId}
+                              aria-expanded={isDetailsOpen}
+                              className="flex min-h-11 min-w-0 flex-1 items-center justify-between gap-3 rounded-2xl border border-border/80 bg-panel px-3 py-2 text-left text-sm font-semibold text-text transition-colors hover:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app"
+                              onClick={() => toggleCourseDetails(course.id)}
+                              type="button"
+                            >
+                              <span className="min-w-0">
+                                <span className="block truncate">{courseLabel}</span>
+                                {course.code && course.name !== course.code ? (
+                                  <span className="mt-0.5 block truncate text-xs font-medium text-text-subtle">
+                                    {course.name}
+                                  </span>
+                                ) : null}
+                              </span>
+                              <ChevronDown
+                                aria-hidden="true"
+                                className={cn(
+                                  "size-4 shrink-0 text-text-subtle transition-transform motion-reduce:transition-none",
+                                  isDetailsOpen && "rotate-180",
+                                )}
+                              />
+                            </button>
                           </div>
                         </div>
                         {courseColorError ? (
@@ -639,6 +700,17 @@ export function CalendarPage() {
                         ) : null}
                         {isSavingColor ? (
                           <p className="mt-2 text-xs font-medium text-text-subtle">Saving color...</p>
+                        ) : null}
+                        {isDetailsOpen ? (
+                          <CourseDetailsPanel
+                            awaitingDateCount={courseAwaitingDateCount}
+                            confirmedCount={courseConfirmedCount}
+                            course={course}
+                            courseColor={courseColor}
+                            panelId={detailsPanelId}
+                            rules={courseRules}
+                            savedRuleCount={courseSavedRuleCount}
+                          />
                         ) : null}
                       </div>
                     )
@@ -705,16 +777,17 @@ export function CalendarPage() {
                 </Card>
               </div>
 
-              {pendingItems.length ? (
+              {reviewQueue.length ? (
+                <section aria-labelledby="review-queue-heading">
                 <Card className="border-warning-border bg-warning-soft p-4">
                   <div className="flex items-center justify-between gap-3">
-                    <h2 className="text-lg font-semibold text-text">Pending items</h2>
+                    <h2 className="text-lg font-semibold text-text" id="review-queue-heading">Review queue</h2>
                     <span className="rounded-full border border-warning-border bg-panel px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-warning">
                       Needs attention
                     </span>
                   </div>
                   <div className="mt-3 grid gap-2">
-                    {pendingItems.map((event) => {
+                    {reviewQueue.map((event) => {
                       const course = courseById.get(event.course_id)
                       return (
                         <button
@@ -744,6 +817,69 @@ export function CalendarPage() {
                     })}
                   </div>
                 </Card>
+                </section>
+              ) : null}
+
+              {awaitingDates.length ? (
+                <section aria-labelledby="awaiting-dates-heading">
+                  <Card className="border-border/80 bg-panel/95 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <h2 className="text-lg font-semibold text-text" id="awaiting-dates-heading">
+                          Awaiting dates
+                        </h2>
+                        <p className="mt-1 text-sm text-text-muted">
+                          These saved items stay off the calendar until you add a date and confirm them.
+                        </p>
+                      </div>
+                      <span className="rounded-full border border-border/80 bg-panel-muted/50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-text-subtle">
+                        {awaitingDates.length} item{awaitingDates.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <div className="mt-3 grid gap-2">
+                      {awaitingDates.map((event) => {
+                        const course = courseById.get(event.course_id)
+                        return (
+                          <Link
+                            className="rounded-2xl border border-border/80 bg-panel-muted/35 px-4 py-3 transition-colors hover:border-accent hover:bg-panel/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app"
+                            key={event.id}
+                            to={`/review?eventId=${event.id}`}
+                          >
+                            <div className="flex items-start gap-3">
+                              <span
+                                aria-hidden="true"
+                                className="mt-0.5 h-10 w-1.5 shrink-0 rounded-full"
+                                style={{
+                                  backgroundColor:
+                                    courseDisplayColors.get(event.course_id) ??
+                                    resolveCourseDisplayColor(event.course_id, course?.color, resolvedTheme),
+                                }}
+                              />
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                  <div className="min-w-0">
+                                    <p className="font-semibold text-text">{event.title}</p>
+                                    <p className="mt-1 text-sm text-text-muted">
+                                      {course?.code || course?.name || "Course"}
+                                    </p>
+                                  </div>
+                                  <span className="inline-flex min-h-8 items-center rounded-full border border-accent/20 bg-accent/10 px-3 text-xs font-semibold text-accent">
+                                    Awaiting date
+                                  </span>
+                                </div>
+                                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs font-medium text-text-subtle">
+                                  <span>Page {event.source_page}</span>
+                                  <span aria-hidden="true">•</span>
+                                  <span>{event.source_quote}</span>
+                                </div>
+                              </div>
+                            </div>
+                          </Link>
+                        )
+                      })}
+                    </div>
+                  </Card>
+                </section>
               ) : null}
 
               {downloadError ? <p className="text-sm font-medium text-danger">{downloadError}</p> : null}
