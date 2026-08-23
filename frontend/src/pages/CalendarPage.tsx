@@ -333,7 +333,6 @@ export function CalendarPage() {
   const reviewQueue = selectedReviewEvents.filter(
     (event) =>
       !isCourseRule(event) &&
-      !event.recurring_series_id &&
       event.review_status === "needs_review",
   )
   const groupedEvents = groupEventsByDate(visibleEvents, courses)

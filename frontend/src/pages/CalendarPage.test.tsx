@@ -588,10 +588,13 @@ test("separates review queue and awaiting dates while exposing course rules from
   const reviewQueueCard = reviewQueueHeading.closest("section")
   expect(reviewQueueCard).not.toBeNull()
   expect(within(reviewQueueCard as HTMLElement).getByText("Project demo date mismatch")).toBeInTheDocument()
+  const recurringReviewButton = within(reviewQueueCard as HTMLElement).getByRole("button", {
+    name: /Recurring review member/i,
+  })
+  expect(recurringReviewButton).toBeInTheDocument()
   expect(within(reviewQueueCard as HTMLElement).queryByText("Final exam date mismatch")).not.toBeInTheDocument()
   expect(within(reviewQueueCard as HTMLElement).queryByText("Weekly reading cadence")).not.toBeInTheDocument()
   expect(within(reviewQueueCard as HTMLElement).queryByText("Lab attendance policy")).not.toBeInTheDocument()
-  expect(within(reviewQueueCard as HTMLElement).queryByText("Recurring review member")).not.toBeInTheDocument()
   expect(within(reviewQueueCard as HTMLElement).queryByText("Confirmed office hour pattern")).not.toBeInTheDocument()
   expect(within(reviewQueueCard as HTMLElement).queryByText("Ignored attendance pattern")).not.toBeInTheDocument()
 
@@ -604,8 +607,11 @@ test("separates review queue and awaiting dates while exposing course rules from
   expect(within(awaitingCard as HTMLElement).queryByText("Lab attendance policy")).not.toBeInTheDocument()
   expect(within(awaitingCard as HTMLElement).queryByText("Recurring pending member")).not.toBeInTheDocument()
 
-  await user.click(screen.getByRole("link", { name: /Weekly reading cadence/i }))
-  expect(screen.getByLabelText("Current route")).toHaveTextContent("/review?eventId=rule-1")
+  const weeklyReadingLink = screen.getByRole("link", { name: /Weekly reading cadence/i })
+  expect(weeklyReadingLink).toHaveAttribute("href", "/review?eventId=rule-1")
+
+  await user.click(recurringReviewButton)
+  expect(screen.getByLabelText("Current route")).toHaveTextContent("/review?eventId=recurring-review-1")
 })
 
 test("course detail disclosure is independent from color and checkbox controls", async () => {
