@@ -22,7 +22,7 @@ export function ThemeSelector({ compact = false }: { compact?: boolean }) {
     <div
       aria-label="Color theme"
       className={cn(
-        "inline-flex items-center gap-1 rounded-2xl border border-border/80 bg-panel-muted/80 p-1 shadow-sm backdrop-blur",
+        "inline-flex w-full min-w-0 items-center gap-1 rounded-2xl border border-border/80 bg-panel-muted/80 p-1 shadow-sm backdrop-blur",
         compact && "rounded-xl",
       )}
       role="group"
@@ -34,7 +34,7 @@ export function ThemeSelector({ compact = false }: { compact?: boolean }) {
             aria-label={label}
             aria-pressed={active}
             className={cn(
-              "inline-flex min-h-11 items-center justify-center gap-2 rounded-xl px-3 text-sm font-semibold transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
+              "inline-flex min-h-11 min-w-0 flex-auto items-center justify-center gap-1 rounded-xl px-1.5 text-sm font-semibold transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus focus-visible:ring-offset-2 focus-visible:ring-offset-bg-app",
               active
                 ? "bg-panel text-text shadow-sm"
                 : "text-text-muted hover:bg-panel/70 hover:text-text",
@@ -45,7 +45,7 @@ export function ThemeSelector({ compact = false }: { compact?: boolean }) {
             type="button"
           >
             <Icon aria-hidden="true" className="size-4 shrink-0" />
-            <span className={compact ? "sr-only" : "hidden sm:inline"}>{shortLabel}</span>
+            <span className={compact ? "sr-only" : "hidden shrink-0 whitespace-nowrap sm:inline"}>{shortLabel}</span>
           </button>
         )
       })}

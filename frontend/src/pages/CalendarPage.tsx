@@ -77,6 +77,22 @@ function parseDateOnly(value: string) {
   return new Date(`${value}T12:00:00`)
 }
 
+function getWallClockTime(value: string | null | undefined) {
+  if (!value) return null
+  return value.split(/[+-]/)[0].slice(0, 5)
+}
+
+function getEventDisplayTime(event: ExtractedEvent) {
+  if (event.is_all_day) return "All day"
+  return getWallClockTime(event.start_time) ?? getWallClockTime(event.end_time) ?? "All day"
+}
+
+function getEventStartValue(event: ExtractedEvent) {
+  if (event.is_all_day) return event.event_date
+  const time = getWallClockTime(event.start_time) ?? getWallClockTime(event.end_time)
+  return time ? `${event.event_date}T${time}` : event.event_date
+}
+
 function startOfWeek(value: Date) {
   const next = new Date(value)
   const weekday = next.getDay()
@@ -348,16 +364,23 @@ export function CalendarPage() {
     .sort((left, right) => (left.event_date ?? "").localeCompare(right.event_date ?? "") || left.title.localeCompare(right.title))
   const monthEvents = visibleEvents.flatMap((event) => {
     if (!event.event_date) return []
+    const eventDate = event.event_date
     const course = courseById.get(event.course_id)
     const displayColor =
       courseDisplayColors.get(event.course_id) ??
       resolveCourseDisplayColor(event.course_id, course?.color, resolvedTheme)
+    const start = getEventStartValue(event) ?? eventDate
+    const allDay = event.is_all_day || (!event.start_time && !event.end_time)
+    const end = !allDay && event.start_time && event.end_time
+      ? `${eventDate}T${getWallClockTime(event.end_time)}`
+      : undefined
     return [
       {
         id: event.id,
         title: event.title,
-        start: event.start_time ? `${event.event_date}T${event.start_time}` : event.event_date,
-        allDay: event.is_all_day,
+        start,
+        end,
+        allDay,
         backgroundColor: displayColor,
         borderColor: displayColor,
         extendedProps: {
@@ -365,6 +388,7 @@ export function CalendarPage() {
           courseColor: displayColor,
           eventTitle: event.title,
           eventType: event.event_type,
+          eventTime: getEventDisplayTime(event),
         },
       },
     ]
@@ -443,14 +467,15 @@ export function CalendarPage() {
         courseColor?: string
         eventTitle?: string
         eventType?: string
+        eventTime?: string
       }
     }
   }) {
-    const { courseCode, courseColor, eventTitle, eventType } = event.extendedProps
+    const { courseCode, courseColor, eventTitle, eventType, eventTime } = event.extendedProps
 
     return (
       <div
-        aria-label={`${courseCode || "Course"} ${eventType || "unknown"} ${eventTitle || "event"}`}
+        aria-label={`${courseCode || "Course"} ${eventType || "unknown"} ${eventTitle || "event"} ${eventTime || ""}`}
         className="flex min-w-0 items-start gap-1.5 overflow-hidden"
       >
         <span
@@ -467,6 +492,7 @@ export function CalendarPage() {
             eventType={eventType || "unknown"}
           />
           <p className="mt-0.5 truncate text-[0.72rem] font-semibold text-text">{eventTitle}</p>
+          {eventTime ? <p className="mt-0.5 text-[0.65rem] text-text/80">{eventTime}</p> : null}
         </div>
       </div>
     )
@@ -760,7 +786,7 @@ export function CalendarPage() {
                               <p className="mt-1 font-semibold text-text">{event.title}</p>
                               <p className="mt-1 text-sm text-text-muted">
                                 {formatDate(event.event_date!)}
-                                {event.start_time ? `  ${event.start_time.slice(0, 5)}` : ""}
+                                {getEventDisplayTime(event) === "All day" ? "" : `  ${getEventDisplayTime(event)}`}
                               </p>
                             </div>
                           </div>
@@ -881,7 +907,7 @@ export function CalendarPage() {
                 </section>
               ) : null}
 
-              {downloadError ? <p className="text-sm font-medium text-danger">{downloadError}</p> : null}
+              {downloadError ? <p className="text-sm font-medium text-danger" role="alert">{downloadError}</p> : null}
 
               {currentView === "timeline" ? (
                 hasSelectedCourses ? (
@@ -931,6 +957,8 @@ export function CalendarPage() {
                         info.jsEvent.preventDefault()
                         navigate(`/review?eventId=${info.event.id}`)
                       }}
+                      // A deadline is a point in time and must not spill into the next day.
+                      defaultTimedEventDuration="00:00:00"
                       eventContent={renderMonthEventContent}
                       events={monthEvents}
                       firstDay={1}
@@ -986,9 +1014,7 @@ export function CalendarPage() {
                                         />
                                       </div>
                                       <p className="mt-2 text-base font-semibold text-text">{event.title}</p>
-                                      <p className="mt-1 text-sm text-text-muted">
-                                        {event.start_time ? event.start_time.slice(0, 5) : "All day"}
-                                      </p>
+                                      <p className="mt-1 text-sm text-text-muted">{getEventDisplayTime(event)}</p>
                                     </div>
                                   </div>
                                 </Link>
@@ -1062,7 +1088,10 @@ function FragmentRow({
                     eventType={event.event_type}
                   />
                   <p className="line-clamp-2">{event.title}</p>
-                  <p className="mt-1 text-xs text-text-muted">{formatDate(event.event_date!)}</p>
+                  <p className="mt-1 text-xs text-text-muted">
+                    {formatDate(event.event_date!)}
+                    {getEventDisplayTime(event) === "All day" ? "" : `  ${getEventDisplayTime(event)}`}
+                  </p>
                 </Link>
               ))}
             </div>

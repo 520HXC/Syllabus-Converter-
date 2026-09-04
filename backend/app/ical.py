@@ -24,13 +24,14 @@ def build_calendar(name: str, events: list[ExtractedEvent]) -> bytes:
             "description",
             f"Imported from syllabus page {item.source_page}.\n\n{item.source_quote}",
         )
-        if item.is_all_day or item.start_time is None:
+        event_time = item.start_time or item.end_time
+        if item.is_all_day or event_time is None:
             event.add("dtstart", item.event_date)
             event.add("dtend", item.event_date + timedelta(days=1))
         else:
             zone = ZoneInfo(item.timezone)
-            event.add("dtstart", datetime.combine(item.event_date, item.start_time, tzinfo=zone))
-            if item.end_time is not None:
+            event.add("dtstart", datetime.combine(item.event_date, event_time, tzinfo=zone))
+            if item.start_time is not None and item.end_time is not None:
                 event.add("dtend", datetime.combine(item.event_date, item.end_time, tzinfo=zone))
         calendar.add_component(event)
 

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 
 import { UploadPanel } from "./UploadPanel"
@@ -52,4 +52,51 @@ test("locks file selection and removal while an upload is in progress", async ()
 
   expect(screen.getByLabelText("Choose syllabus PDFs")).toBeDisabled()
   expect(screen.getByRole("button", { name: "Remove cs101.pdf" })).toBeDisabled()
+})
+
+test("keeps the selected files visible after an upload failure so the same batch can be retried", async () => {
+  const user = userEvent.setup()
+  const onUpload = vi
+    .fn<(files: File[]) => Promise<void>>()
+    .mockRejectedValueOnce(new Error("Backend rejected the upload."))
+    .mockResolvedValueOnce(undefined)
+
+  render(<UploadPanel onUpload={onUpload} />)
+  const file = new File(["%PDF-1.7"], "cs101.pdf", { type: "application/pdf" })
+
+  await user.upload(screen.getByLabelText("Choose syllabus PDFs"), file)
+  await user.click(screen.getByRole("button", { name: "Process 1 syllabus" }))
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Backend rejected the upload.")
+  expect(screen.getByText("cs101.pdf")).toBeInTheDocument()
+  expect(screen.getByRole("button", { name: "Process 1 syllabus" })).toBeEnabled()
+
+  await user.click(screen.getByRole("button", { name: "Process 1 syllabus" }))
+  await waitFor(() => expect(onUpload).toHaveBeenCalledTimes(2))
+})
+
+test("ignores a rapid second submit while the first upload is still starting", async () => {
+  let resolveUpload: () => void = () => undefined
+  const onUpload = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveUpload = resolve
+      }),
+  )
+
+  render(<UploadPanel onUpload={onUpload} />)
+  const file = new File(["%PDF-1.7"], "cs101.pdf", { type: "application/pdf" })
+
+  fireEvent.change(screen.getByLabelText("Choose syllabus PDFs"), {
+    target: { files: [file] },
+  })
+
+  const submit = screen.getByRole("button", { name: "Process 1 syllabus" })
+  fireEvent.click(submit)
+  fireEvent.click(submit)
+
+  expect(onUpload).toHaveBeenCalledTimes(1)
+
+  resolveUpload()
+  await waitFor(() => expect(screen.getByRole("button", { name: "Process 1 syllabus" })).toBeEnabled())
 })

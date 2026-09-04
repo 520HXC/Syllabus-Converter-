@@ -180,6 +180,13 @@ function renderCalendarPage(initialEntry = "/calendar") {
   )
 }
 
+function getThisWeekSection() {
+  const thisWeekHeading = screen.getByRole("heading", { name: "This week" })
+  const thisWeekSection = thisWeekHeading.parentElement?.parentElement
+  expect(thisWeekSection).not.toBeNull()
+  return thisWeekSection as HTMLElement
+}
+
 beforeEach(() => {
   const currentWeekWednesday = getDateInCurrentWeek(2)
   reviewData.events = [
@@ -283,8 +290,8 @@ test("shows the approved header actions, this week section, shared timeline scro
   expect(await screen.findByRole("button", { name: "Timeline" })).toHaveAttribute("aria-pressed", "true")
   expect(screen.getByLabelText("Current route")).toHaveTextContent("/calendar?view=timeline")
   expect(screen.getByRole("link", { name: /Final exam/i })).toHaveAttribute("href", "/review?eventId=event-1")
-  expect(screen.getByRole("heading", { name: "This week" })).toBeInTheDocument()
-  expect(screen.getByRole("link", { name: /Office hours kickoff/i })).toHaveAttribute("href", "/review?eventId=event-4")
+  const thisWeekSection = getThisWeekSection()
+  expect(within(thisWeekSection).getByRole("link", { name: /Office hours kickoff/i })).toHaveAttribute("href", "/review?eventId=event-4")
   expect(screen.getByText(formatWeekRangeFromDates(monday, sunday))).toBeInTheDocument()
   expect(screen.getAllByTestId("timeline-scroll-region")).toHaveLength(1)
   expect(screen.getByRole("region", { name: "Semester timeline" })).toBeInTheDocument()
@@ -453,13 +460,83 @@ test("uses the natural Monday through Sunday window for This week", async () => 
 
   renderCalendarPage()
 
-  const thisWeekHeading = await screen.findByRole("heading", { name: "This week" })
-  const thisWeekSection = thisWeekHeading.parentElement?.parentElement
-  expect(thisWeekSection).not.toBeNull()
+  await screen.findByRole("heading", { name: "This week" })
+  const thisWeekSection = getThisWeekSection()
   expect(within(thisWeekSection as HTMLElement).getByText(formatWeekRangeFromDates(monday, sunday))).toBeInTheDocument()
   expect(within(thisWeekSection as HTMLElement).getByText("Monday recap")).toBeInTheDocument()
   expect(within(thisWeekSection as HTMLElement).getByText("Sunday workshop")).toBeInTheDocument()
   expect(within(thisWeekSection as HTMLElement).queryByText("Next Monday kickoff")).not.toBeInTheDocument()
+})
+
+test("shows deadline-only events at end_time in this week and list while keeping explicit all-day events marked", async () => {
+  const user = userEvent.setup()
+  const thisWeekWednesday = getDateInCurrentWeek(2)
+  listEventsMock.mockImplementationOnce(async (): Promise<ExtractedEvent[]> => [
+    {
+      id: "deadline-only",
+      semester_id: "semester-1",
+      course_id: "course-1",
+      document_id: "document-1",
+      title: "Deadline only event",
+      event_type: "deadline",
+      event_date: formatDate(thisWeekWednesday),
+      start_time: null,
+      end_time: "23:59:00-05:00",
+      timezone: "America/New_York",
+      is_all_day: false,
+      source_quote: "Deadline only event for end time test",
+      source_page: 9,
+      confidence: "medium" as const,
+      warning_codes: [],
+      warning_reason: null,
+      review_status: "confirmed" as const,
+    },
+    {
+      id: "all-day-event",
+      semester_id: "semester-1",
+      course_id: "course-1",
+      document_id: "document-1",
+      title: "Explicit all-day event",
+      event_type: "assignment",
+      event_date: formatDate(getDateInCurrentWeek(1)),
+      start_time: null,
+      end_time: "21:00:00",
+      timezone: "America/New_York",
+      is_all_day: true,
+      source_quote: "All-day event with time noise",
+      source_page: 8,
+      confidence: "medium" as const,
+      warning_codes: [],
+      warning_reason: null,
+      review_status: "confirmed" as const,
+    },
+  ])
+
+  renderCalendarPage()
+
+  const thisWeekSection = await screen.findByRole("heading", { name: "This week" }).then((heading) => {
+    const section = heading.parentElement?.parentElement
+    expect(section).not.toBeNull()
+    return section as HTMLElement
+  })
+  const timelineRegion = screen.getByRole("region", { name: "Semester timeline" })
+  expect(within(timelineRegion).getByRole("link", { name: /Deadline only event/i })).toHaveTextContent(/23:59/)
+  const deadlineCard = within(thisWeekSection).getByRole("link", { name: /Deadline only event/i })
+  expect(within(deadlineCard).getByText(/\b23:59\b/)).toBeInTheDocument()
+  const allDayCard = within(thisWeekSection).getByRole("link", { name: /Explicit all-day event/i })
+  expect(within(allDayCard).queryByText(/23:59/)).not.toBeInTheDocument()
+
+  await user.click(screen.getByRole("button", { name: "List" }))
+  const listDeadlineCard = await waitFor(() =>
+    screen.getByTestId("calendar-course-rail-list-deadline-only").closest("a"),
+  )
+  expect(listDeadlineCard).not.toBeNull()
+  expect(within(listDeadlineCard as HTMLElement).getByText(/\b23:59\b/)).toBeInTheDocument()
+  expect(within(listDeadlineCard as HTMLElement).queryByText("All day")).not.toBeInTheDocument()
+  const allDayListCard = screen.getByTestId("calendar-course-rail-list-all-day-event").closest("a")
+  expect(allDayListCard).not.toBeNull()
+  expect(within(allDayListCard as HTMLElement).getByText("All day")).toBeInTheDocument()
+  expect(within(allDayListCard as HTMLElement).queryByText(/\b21:00\b/)).not.toBeInTheDocument()
 })
 
 test("computes the current natural week in the semester timezone instead of browser local time", () => {
@@ -582,7 +659,7 @@ test("separates review queue and awaiting dates while exposing course rules from
   expect(within(detailsPanel as HTMLElement).getByText("Lab attendance required every Tuesday")).toBeInTheDocument()
   expect(within(detailsPanel as HTMLElement).queryByText("Confirmed office hour pattern")).not.toBeInTheDocument()
   expect(within(detailsPanel as HTMLElement).queryByText("Ignored attendance pattern")).not.toBeInTheDocument()
-  expect(screen.getByText("Office hours kickoff")).toBeInTheDocument()
+  expect(within(getThisWeekSection()).getByText("Office hours kickoff")).toBeInTheDocument()
 
   const reviewQueueHeading = screen.getByRole("heading", { name: "Review queue" })
   const reviewQueueCard = reviewQueueHeading.closest("section")

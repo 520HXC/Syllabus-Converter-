@@ -2573,6 +2573,7 @@ def process_job(
             job.status = JobStatus.NEEDS_REVIEW
             job.stage_detail = "Ready for review"
             job.error_message = None
+            job.completed_at = None
             session.commit()
     except Exception as error:
         with session_factory() as session:

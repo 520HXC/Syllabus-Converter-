@@ -53,6 +53,16 @@ from .schemas import (
 from .storage import StorageError, StorageService
 
 router = APIRouter()
+DISPATCH_FAILURE_MESSAGE = "Processing could not be started. Please try again."
+
+
+def cleanup_saved_uploads(
+    storage: StorageService,
+    storage_keys: list[str],
+) -> None:
+    if not storage_keys:
+        return
+    storage.discard_new_uploads(storage_keys)
 
 
 def safe_filename(filename: str | None) -> str:
@@ -147,6 +157,29 @@ def dispatch_job(job_id: UUID, settings: Settings) -> None:
     from .worker import process_document_job
 
     process_document_job.delay(str(job_id))
+
+
+def mark_job_dispatch_failed(
+    db: Session,
+    job: ProcessingJob,
+    error: Exception,
+) -> None:
+    job.status = JobStatus.FAILED
+    job.stage_detail = "Dispatch failed"
+    job.error_message = DISPATCH_FAILURE_MESSAGE
+    db.commit()
+    db.refresh(job)
+
+
+def dispatch_or_mark_failed(
+    db: Session,
+    job: ProcessingJob,
+    settings: Settings,
+) -> None:
+    try:
+        dispatch_job(job.id, settings)
+    except Exception as error:
+        mark_job_dispatch_failed(db, job, error)
 
 
 @router.get("/health")
@@ -377,38 +410,66 @@ async def upload_syllabi(
 
     storage = StorageService(settings)
     jobs: list[ProcessingJob] = []
-    for uploaded, content in pending:
-        filename = safe_filename(uploaded.filename)
-        document_id = uuid4()
-        storage_key = f"{user.id}/{semester.id}/{document_id}/{filename}"
-        try:
+    saved_storage_keys: list[str] = []
+    try:
+        for uploaded, content in pending:
+            filename = safe_filename(uploaded.filename)
+            document_id = uuid4()
+            storage_key = f"{user.id}/{semester.id}/{document_id}/{filename}"
+            saved_storage_keys.append(storage_key)
             storage.save(storage_key, content, "application/pdf")
-        except StorageError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
 
-        document = SyllabusDocument(
-            id=document_id,
-            user_id=user.id,
-            semester_id=semester.id,
-            filename=filename,
-            content_type="application/pdf",
-            size_bytes=len(content),
-            storage_key=storage_key,
-        )
-        job = ProcessingJob(
-            user_id=user.id,
-            semester_id=semester.id,
-            document=document,
-            status=JobStatus.QUEUED,
-            stage_detail="Waiting to process",
-        )
-        db.add(job)
-        jobs.append(job)
-
-    db.commit()
+            document = SyllabusDocument(
+                id=document_id,
+                user_id=user.id,
+                semester_id=semester.id,
+                filename=filename,
+                content_type="application/pdf",
+                size_bytes=len(content),
+                storage_key=storage_key,
+            )
+            job = ProcessingJob(
+                user_id=user.id,
+                semester_id=semester.id,
+                document=document,
+                status=JobStatus.QUEUED,
+                stage_detail="Waiting to process",
+            )
+            db.add(job)
+            jobs.append(job)
+        db.commit()
+    except StorageError as error:
+        db.rollback()
+        try:
+            cleanup_saved_uploads(storage, saved_storage_keys)
+        except StorageError as cleanup_error:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"{error} Partial upload cleanup failed. "
+                    f"{cleanup_error}"
+                ),
+            ) from cleanup_error
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        db.rollback()
+        try:
+            cleanup_saved_uploads(storage, saved_storage_keys)
+        except StorageError as cleanup_error:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Upload could not be completed and cleanup failed. "
+                    f"{cleanup_error}"
+                ),
+            ) from cleanup_error
+        raise HTTPException(
+            status_code=500,
+            detail="Upload could not be completed.",
+        ) from error
     for job in jobs:
         db.refresh(job)
-        dispatch_job(job.id, settings)
+        dispatch_or_mark_failed(db, job, settings)
 
     return UploadResponse(jobs=[job_read(job) for job in jobs])
 
@@ -481,7 +542,7 @@ def retry_job(
     job.error_message = None
     db.commit()
     db.refresh(job)
-    dispatch_job(job.id, settings)
+    dispatch_or_mark_failed(db, job, settings)
     return job_read(job)
 
 
@@ -510,7 +571,6 @@ def reprocess_job(
     job.status = JobStatus.QUEUED
     job.stage_detail = "Waiting to reprocess"
     job.error_message = None
-    job.completed_at = None
     job.fallback_used = False
     job.fallback_reason_codes = []
     db.commit()
@@ -530,7 +590,7 @@ def reprocess_job(
             if refreshed is not None:
                 return job_read(refreshed)
     else:
-        dispatch_job(job.id, settings)
+        dispatch_or_mark_failed(db, job, settings)
     return job_read(job)
 
 

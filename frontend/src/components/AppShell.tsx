@@ -151,7 +151,7 @@ export function AppShell({
 
         <nav
           aria-label="Mobile navigation"
-          className="fixed inset-x-0 bottom-0 z-30 border-t border-border/80 bg-panel/96 px-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-10px_30px_rgba(15,23,42,0.08)] backdrop-blur lg:hidden"
+          className="fixed inset-x-0 bottom-0 z-30 border-t border-border/80 bg-panel/[0.96] px-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-10px_30px_rgba(15,23,42,0.08)] backdrop-blur lg:hidden"
         >
           <div className="mx-auto flex max-w-2xl gap-2">
             {navItems.map((item) => <ShellNavLink key={item.to} mobile {...item} />)}

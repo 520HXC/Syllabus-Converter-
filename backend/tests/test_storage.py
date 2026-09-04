@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -74,6 +75,41 @@ def test_delete_many_rejects_local_path_escape(tmp_path: Path):
         storage.delete_many(["../secrets.txt"])
 
 
+def test_discard_new_uploads_ignores_missing_keys_while_deleting_existing_local_files(
+    tmp_path: Path,
+):
+    settings = build_settings(tmp_path)
+    storage = StorageService(settings)
+    existing = settings.local_storage_path / "user-a" / "semester-a" / "one.pdf"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_bytes(b"one")
+
+    storage.discard_new_uploads(
+        ["user-a/semester-a/one.pdf", "user-a/semester-a/missing.pdf"]
+    )
+
+    assert not existing.exists()
+
+
+def test_discard_new_uploads_raises_when_local_cleanup_hits_os_error(
+    monkeypatch,
+    tmp_path: Path,
+):
+    settings = build_settings(tmp_path)
+    storage = StorageService(settings)
+    existing = settings.local_storage_path / "user-a" / "semester-a" / "one.pdf"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_bytes(b"one")
+
+    def fail_unlink(self, missing_ok: bool = False):
+        raise OSError("disk offline")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    with pytest.raises(StorageError, match="could not be deleted"):
+        storage.discard_new_uploads(["user-a/semester-a/one.pdf"])
+
+
 def test_delete_many_batches_supabase_exact_keys(monkeypatch, tmp_path: Path):
     settings = build_settings(tmp_path, storage_mode="supabase")
     storage = StorageService(settings)
@@ -82,12 +118,15 @@ def test_delete_many_batches_supabase_exact_keys(monkeypatch, tmp_path: Path):
     def fake_get(url: str, headers: dict[str, str], timeout: int):
         return httpx.Response(200, content=b"%PDF-1.4 test")
 
-    def fake_delete(url: str, headers: dict[str, str], json: dict[str, object], timeout: int):
+    def fake_delete(
+        method: str, url: str, headers: dict[str, str], json: dict[str, object], timeout: int,
+    ):
+        assert method == "DELETE"
         requests.append((url, json, headers))
         return httpx.Response(200, json={"data": []})
 
     monkeypatch.setattr("app.storage.httpx.get", fake_get)
-    monkeypatch.setattr("app.storage.httpx.delete", fake_delete)
+    monkeypatch.setattr("app.storage.httpx.request", fake_delete)
     keys = [f"user-a/semester-a/file-{index}.pdf" for index in range(1005)]
 
     storage.delete_many(keys)
@@ -108,14 +147,98 @@ def test_delete_many_raises_on_supabase_error(monkeypatch, tmp_path: Path):
     def fake_get(url: str, headers: dict[str, str], timeout: int):
         return httpx.Response(200, content=b"%PDF-1.4 test")
 
-    def fake_delete(url: str, headers: dict[str, str], json: dict[str, object], timeout: int):
+    def fake_delete(
+        method: str, url: str, headers: dict[str, str], json: dict[str, object], timeout: int,
+    ):
+        assert method == "DELETE"
         return httpx.Response(500, json={"error": "boom"})
 
     monkeypatch.setattr("app.storage.httpx.get", fake_get)
-    monkeypatch.setattr("app.storage.httpx.delete", fake_delete)
+    monkeypatch.setattr("app.storage.httpx.request", fake_delete)
 
     with pytest.raises(StorageError, match="Supabase Storage rejected the delete"):
         storage.delete_many(["user-a/semester-a/file.pdf"])
+
+
+def test_discard_new_uploads_uses_verified_supabase_delete_contract(
+    monkeypatch,
+    tmp_path: Path,
+):
+    settings = build_settings(tmp_path, storage_mode="supabase")
+    storage = StorageService(settings)
+    requests: list[tuple[str, dict[str, object], dict[str, str], int]] = []
+
+    def fake_delete(
+        method: str, url: str, headers: dict[str, str], json: dict[str, object], timeout: int,
+    ):
+        assert method == "DELETE"
+        requests.append((url, json, headers, timeout))
+        return httpx.Response(200, json={"data": []})
+
+    monkeypatch.setattr("app.storage.httpx.request", fake_delete)
+
+    storage.discard_new_uploads(["user-a/semester-a/file.pdf"])
+
+    assert requests == [
+        (
+            "https://example.supabase.co/storage/v1/object/syllabi",
+            {"prefixes": ["user-a/semester-a/file.pdf"]},
+            {
+                "Authorization": "Bearer service-role",
+                "apikey": "service-role",
+                "Content-Type": "application/json",
+            },
+            60,
+        )
+    ]
+
+
+def test_discard_new_uploads_raises_on_supabase_error(monkeypatch, tmp_path: Path):
+    settings = build_settings(tmp_path, storage_mode="supabase")
+    storage = StorageService(settings)
+
+    def fake_delete(
+        method: str, url: str, headers: dict[str, str], json: dict[str, object], timeout: int,
+    ):
+        assert method == "DELETE"
+        return httpx.Response(500, json={"error": "boom"})
+
+    monkeypatch.setattr("app.storage.httpx.request", fake_delete)
+
+    with pytest.raises(StorageError, match="Supabase Storage rejected the delete"):
+        storage.discard_new_uploads(["user-a/semester-a/file.pdf"])
+
+
+def test_discard_new_uploads_does_not_hide_supabase_not_found(monkeypatch, tmp_path: Path):
+    settings = build_settings(tmp_path, storage_mode="supabase")
+    storage = StorageService(settings)
+
+    def fake_delete(
+        method: str, url: str, headers: dict[str, str], json: dict[str, object], timeout: int,
+    ):
+        assert method == "DELETE"
+        return httpx.Response(404, json={"error": "not found"})
+
+    monkeypatch.setattr("app.storage.httpx.request", fake_delete)
+
+    with pytest.raises(StorageError, match="Supabase Storage rejected the delete with status 404"):
+        storage.discard_new_uploads(["user-a/semester-a/file.pdf"])
+
+
+def test_discard_new_uploads_surfaces_supabase_transport_failure(monkeypatch, tmp_path: Path):
+    settings = build_settings(tmp_path, storage_mode="supabase")
+    storage = StorageService(settings)
+
+    def fake_delete(
+        method: str, url: str, headers: dict[str, str], json: dict[str, object], timeout: int,
+    ):
+        assert method == "DELETE"
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr("app.storage.httpx.request", fake_delete)
+
+    with pytest.raises(StorageError, match="Storage request failed"):
+        storage.discard_new_uploads(["user-a/semester-a/file.pdf"])
 
 
 def test_delete_many_restores_files_after_partial_supabase_batch_failure(
@@ -131,7 +254,10 @@ def test_delete_many_restores_files_after_partial_supabase_batch_failure(
         storage_key = url.split("/authenticated/syllabi/", 1)[1]
         return httpx.Response(200, content=f"backup:{storage_key}".encode())
 
-    def fake_delete(url: str, headers: dict[str, str], json: dict[str, object], timeout: int):
+    def fake_delete(
+        method: str, url: str, headers: dict[str, str], json: dict[str, object], timeout: int,
+    ):
+        assert method == "DELETE"
         deleted_batches.append(list(json["prefixes"]))
         if len(deleted_batches) == 2:
             return httpx.Response(500, json={"error": "boom"})
@@ -141,7 +267,7 @@ def test_delete_many_restores_files_after_partial_supabase_batch_failure(
         restored.append((storage_key, content, content_type))
 
     monkeypatch.setattr("app.storage.httpx.get", fake_get)
-    monkeypatch.setattr("app.storage.httpx.delete", fake_delete)
+    monkeypatch.setattr("app.storage.httpx.request", fake_delete)
     monkeypatch.setattr(StorageService, "save", fake_save)
     keys = [f"user-a/semester-a/file-{index}.pdf" for index in range(1001)]
 
@@ -153,3 +279,31 @@ def test_delete_many_restores_files_after_partial_supabase_batch_failure(
         (storage_key, f"backup:{storage_key}".encode(), "application/pdf")
         for storage_key in keys[:1000]
     ]
+
+
+@pytest.mark.parametrize("operation", ["delete_many", "discard_new_uploads"])
+def test_supabase_deletion_uses_real_httpx_request_serialization(
+    monkeypatch, tmp_path: Path, operation: str,
+):
+    storage = StorageService(build_settings(tmp_path, storage_mode="supabase"))
+    requests: list[httpx.Request] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, content=b"%PDF-1.4 test", request=request)
+        return httpx.Response(200, json=[], request=request)
+
+    # Keep HTTPX's public call signatures and JSON serialization real.
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle_request)
+    keys = ["user-a/semester-a/course #1.pdf"]
+    backups = getattr(storage, operation)(keys)
+    if backups:
+        storage.cleanup_backups(backups)
+
+    deletes = [request for request in requests if request.method == "DELETE"]
+    assert len(deletes) == 1
+    assert str(deletes[0].url) == "https://example.supabase.co/storage/v1/object/syllabi"
+    assert json.loads(deletes[0].content) == {"prefixes": keys}
+    assert deletes[0].headers["Content-Type"] == "application/json"
+    assert deletes[0].headers["Authorization"] == "Bearer service-role"

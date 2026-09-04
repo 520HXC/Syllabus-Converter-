@@ -1,9 +1,23 @@
+import { File as NativeFile } from "node:buffer"
 import { useEffect } from "react"
 import { render, waitFor } from "@testing-library/react"
+import { afterEach } from "vitest"
 
 import { useApi } from "./api"
 
 const getAccessTokenMock = vi.hoisted(() => vi.fn(async () => "test-token"))
+
+class NativeFormDataStub {
+  private values = new Map<string, unknown[]>()
+
+  append(name: string, value: FormDataEntryValue) {
+    this.values.set(name, [...(this.values.get(name) ?? []), value])
+  }
+
+  getAll(name: string): FormDataEntryValue[] {
+    return [...(this.values.get(name) ?? [])] as FormDataEntryValue[]
+  }
+}
 
 vi.mock("./auth", () => ({
   useAuth: () => ({
@@ -20,6 +34,10 @@ function ApiHarness({ onReady }: { onReady: (api: ReturnType<typeof useApi>) => 
 
   return null
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 test("deleteSemester accepts a 204 response with no body", async () => {
   const fetchMock = vi.fn(async () => new Response(null, { status: 204 }))
@@ -118,4 +136,44 @@ test("updateCourse accepts a partial color-only payload", async () => {
       body: JSON.stringify({ color: "#2563EB" }),
     }),
   )
+})
+
+test("uploadSyllabi marks empty-MIME PDF files as application/pdf before appending them to FormData", async () => {
+  const fetchMock = vi.fn(async () =>
+    new Response(JSON.stringify({ jobs: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  )
+  vi.stubGlobal("File", NativeFile as unknown as typeof File)
+  vi.stubGlobal("FormData", NativeFormDataStub as unknown as typeof FormData)
+  vi.stubGlobal("fetch", fetchMock)
+  let apiRef: ReturnType<typeof useApi> | null = null
+
+  render(<ApiHarness onReady={(api) => { apiRef = api }} />)
+  await waitFor(() => expect(apiRef).not.toBeNull())
+
+  const binaryPdf = Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0xff, 0x00, 0x41])
+  const emptyMimePdf = new File([binaryPdf], "scan.PDF", { type: "" })
+  const normalPdf = new File([Uint8Array.from([0x25, 0x50, 0x44, 0x46, 0x30])], "course.pdf", {
+    type: "application/pdf",
+  })
+
+  await apiRef!.uploadSyllabi("semester-1", [emptyMimePdf, normalPdf])
+
+  const firstCall = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+  const init = firstCall[1]
+  const body = init.body as FormData
+  const [uploadedEmptyMimePdf, uploadedNormalPdf] = body.getAll("files") as unknown as [File, File]
+
+  expect(uploadedEmptyMimePdf.name).toBe("scan.PDF")
+  expect(uploadedEmptyMimePdf.type).toBe("application/pdf")
+  expect(uploadedEmptyMimePdf.size).toBe(emptyMimePdf.size)
+  expect(uploadedEmptyMimePdf.lastModified).toBe(emptyMimePdf.lastModified)
+  expect(Array.from(new Uint8Array(await uploadedEmptyMimePdf.arrayBuffer()))).toEqual(Array.from(binaryPdf))
+  expect(uploadedNormalPdf.name).toBe("course.pdf")
+  expect(uploadedNormalPdf.type).toBe("application/pdf")
+  expect(uploadedNormalPdf.size).toBe(normalPdf.size)
+  expect(uploadedNormalPdf.lastModified).toBe(normalPdf.lastModified)
+  expect(Array.from(new Uint8Array(await uploadedNormalPdf.arrayBuffer()))).toEqual([0x25, 0x50, 0x44, 0x46, 0x30])
 })

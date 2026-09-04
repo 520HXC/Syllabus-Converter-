@@ -59,6 +59,14 @@ async function getErrorPayload(response: Response) {
   }
 }
 
+function normalizeUploadFile(file: File) {
+  if (file.type || !file.name.toLowerCase().endsWith(".pdf")) return file
+  return new File([file], file.name, {
+    type: "application/pdf",
+    lastModified: file.lastModified,
+  })
+}
+
 export function useApi() {
   const { getAccessToken } = useAuth()
 
@@ -111,7 +119,7 @@ export function useApi() {
         requestVoid(`/semesters/${semesterId}`, { method: "DELETE" }),
       uploadSyllabi: async (semesterId: string, files: File[]) => {
         const body = new FormData()
-        files.forEach((file) => body.append("files", file))
+        files.forEach((file) => body.append("files", normalizeUploadFile(file)))
         return request<{ jobs: ProcessingJob[] }>(`/semesters/${semesterId}/syllabi`, {
           method: "POST",
           body,

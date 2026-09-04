@@ -93,6 +93,17 @@ class StorageService:
             self.cleanup_backups(backups)
             raise
 
+    def discard_new_uploads(self, storage_keys: list[str]) -> None:
+        if not storage_keys:
+            return
+        try:
+            if self.settings.storage_mode == "supabase":
+                self._discard_new_uploads_supabase(storage_keys)
+                return
+            self._discard_new_uploads_local(storage_keys)
+        except httpx.HTTPError as error:
+            raise StorageError("Storage request failed.") from error
+
     def _resolve_local_path(self, storage_key: str) -> Path:
         upload_root = self.settings.local_storage_path.resolve()
         path = (upload_root / storage_key).resolve()
@@ -150,6 +161,16 @@ class StorageService:
                 raise
             raise StorageError("The uploaded PDF could not be deleted.") from error
 
+    def _discard_new_uploads_local(self, storage_keys: list[str]) -> None:
+        for storage_key in storage_keys:
+            path = self._resolve_local_path(storage_key)
+            try:
+                path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise StorageError("The uploaded PDF could not be deleted.") from error
+
     def _delete_many_supabase(self, backups: list[StorageBackup]) -> None:
         if not self.settings.supabase_url:
             raise StorageError("Supabase URL is not configured.")
@@ -160,7 +181,8 @@ class StorageService:
         deleted: list[StorageBackup] = []
         for index in range(0, len(backups), 1000):
             batch = backups[index : index + 1000]
-            response = httpx.delete(
+            response = httpx.request(
+                "DELETE",
                 url,
                 headers={**self._headers(), "Content-Type": "application/json"},
                 json={"prefixes": [backup.storage_key for backup in batch]},
@@ -172,3 +194,24 @@ class StorageService:
                     f"Supabase Storage rejected the delete with status {response.status_code}."
                 )
             deleted.extend(batch)
+
+    def _discard_new_uploads_supabase(self, storage_keys: list[str]) -> None:
+        if not self.settings.supabase_url:
+            raise StorageError("Supabase URL is not configured.")
+        url = (
+            f"{self.settings.supabase_url.rstrip('/')}/storage/v1/object/"
+            f"{self.settings.supabase_storage_bucket}"
+        )
+        for index in range(0, len(storage_keys), 1000):
+            batch = storage_keys[index : index + 1000]
+            response = httpx.request(
+                "DELETE",
+                url,
+                headers={**self._headers(), "Content-Type": "application/json"},
+                json={"prefixes": batch},
+                timeout=60,
+            )
+            if response.is_error:
+                raise StorageError(
+                    f"Supabase Storage rejected the delete with status {response.status_code}."
+                )

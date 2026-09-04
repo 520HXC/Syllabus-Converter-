@@ -206,13 +206,56 @@ beforeEach(() => {
 
 test("uses stored course colors in dark mode and shared type labels across filters, this week, timeline, month, and list", async () => {
   const user = userEvent.setup()
+  listEventsMock.mockImplementationOnce(async () => [
+    {
+      id: "event-1",
+      semester_id: "semester-1",
+      course_id: "course-1",
+      document_id: "document-1",
+      title: "Assigned chapter",
+      event_type: "reading",
+      event_date: getCurrentWeekDate(),
+      start_time: "14:30:00",
+      end_time: null,
+      timezone: "America/New_York",
+      is_all_day: false,
+      source_quote: "Assigned chapter due this week",
+      source_page: 6,
+      confidence: "medium" as const,
+      warning_codes: [],
+      warning_reason: null,
+      review_status: "confirmed" as const,
+    },
+    {
+      id: "event-2",
+      semester_id: "semester-1",
+      course_id: "course-2",
+      document_id: "document-2",
+      title: "Portfolio checkpoint",
+      event_type: "deadline",
+      event_date: "2026-09-15",
+      start_time: null,
+      end_time: "23:59:00-05:00",
+      timezone: "America/New_York",
+      is_all_day: false,
+      source_quote: "Portfolio checkpoint due on September 15",
+      source_page: 2,
+      confidence: "high" as const,
+      warning_codes: [],
+      warning_reason: null,
+      review_status: "confirmed" as const,
+    },
+  ] satisfies ExtractedEvent[])
   renderCalendarPage()
 
   expect(await screen.findByRole("heading", { name: "Fall 2026" })).toBeInTheDocument()
   expect(screen.getByTestId("course-filter-swatch-course-1")).toHaveStyle({ backgroundColor: "#0D9488" })
   expect(screen.getByTestId("course-filter-swatch-course-2")).toHaveStyle({ backgroundColor: "#2563EB" })
 
-  const thisWeekCard = await screen.findByRole("link", { name: /Assigned chapter/i })
+  const thisWeekHeading = await screen.findByRole("heading", { name: "This week" })
+  const thisWeekSection = thisWeekHeading.parentElement?.parentElement
+  expect(thisWeekSection).not.toBeNull()
+  const thisWeekCard = within(thisWeekSection as HTMLElement).getByRole("link", { name: /Assigned chapter/i })
   expect(within(thisWeekCard).getByText("reading")).toBeInTheDocument()
   expect(screen.getByTestId("calendar-course-rail-this-week-event-1")).toHaveStyle({
     backgroundColor: "#0D9488",
@@ -232,7 +275,14 @@ test("uses stored course colors in dark mode and shared type labels across filte
       jsEvent: { preventDefault: () => void }
     }) => void
     eventContent: (arg: { event: { title: string; extendedProps: Record<string, unknown> } }) => ReactNode
-    events: Array<{ id: string; backgroundColor: string; borderColor: string; extendedProps: Record<string, unknown> }>
+    events: Array<{
+      id: string
+      start: string
+      allDay: boolean
+      backgroundColor: string
+      borderColor: string
+      extendedProps: Record<string, unknown>
+    }>
   }
   expect(monthProps.events).toEqual(
     expect.arrayContaining([
@@ -240,6 +290,9 @@ test("uses stored course colors in dark mode and shared type labels across filte
       expect.objectContaining({ id: "event-2", backgroundColor: "#2563EB", borderColor: "#2563EB" }),
     ]),
   )
+  const monthDeadlineOnlyEvent = monthProps.events.find((item) => item.id === "event-2")
+  expect(monthDeadlineOnlyEvent).toBeDefined()
+  expect(monthDeadlineOnlyEvent).toMatchObject({ allDay: false, start: "2026-09-15T23:59" })
   const monthEventContent = render(
     <>{monthProps.eventContent({
       event: {
@@ -402,4 +455,32 @@ test("rolls back an optimistic color update and shows a course-level alert when 
   expect(screen.getByTestId("course-color-button-course-1")).toBeEnabled()
   expect(screen.getByTestId("course-filter-swatch-course-1")).toHaveStyle({ backgroundColor: "#0D9488" })
   expect(screen.getByTestId("calendar-course-rail-this-week-event-1")).toHaveStyle({ backgroundColor: "#0D9488" })
+})
+
+
+test("maps all-day fallbacks and ordinary time ranges without inventing deadline durations", async () => {
+  const user = userEvent.setup()
+  const baseEvents = await listEventsMock()
+  const base = baseEvents[0]
+  listEventsMock.mockResolvedValue([
+    { ...base, id: "no-time", is_all_day: false, start_time: null, end_time: null },
+    { ...base, id: "range", is_all_day: false, start_time: "09:00:00-04:00", end_time: "10:30:00-04:00" },
+    { ...base, id: "deadline", is_all_day: false, start_time: null, end_time: "23:59:00-05:00" },
+    { ...base, id: "all-day", is_all_day: true, start_time: "09:00:00", end_time: "10:30:00" },
+  ])
+  renderCalendarPage()
+  await screen.findByRole("heading", { name: "Fall 2026" })
+  await user.click(screen.getByRole("button", { name: "Month" }))
+  await waitFor(() => expect(fullCalendarPropsSpy).toHaveBeenCalled())
+  const props = fullCalendarPropsSpy.mock.calls.at(-1)?.[0] as {
+    events: Array<{ id: string; start: string; end?: string; allDay: boolean; extendedProps: Record<string, unknown> }>
+  }
+  expect(props.events.find((event) => event.id === "no-time")).toMatchObject({ start: base.event_date, allDay: true })
+  expect(props.events.find((event) => event.id === "range")).toMatchObject({
+    start: `${base.event_date}T09:00`, end: `${base.event_date}T10:30`, allDay: false,
+  })
+  for (const id of ["deadline", "all-day", "no-time"]) {
+    expect(props.events.find((event) => event.id === id)?.end).toBeUndefined()
+  }
+  expect(props.events.find((event) => event.id === "all-day")).toMatchObject({ start: base.event_date, allDay: true })
 })

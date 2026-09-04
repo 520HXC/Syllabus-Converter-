@@ -27,6 +27,7 @@ export function ProcessingPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [jobPendingReprocess, setJobPendingReprocess] = useState<ProcessingJob | null>(null)
+  const [retryFailure, setRetryFailure] = useState<{ semesterId: string; jobId: string; message: string } | null>(null)
   const reprocessTitleId = useId()
   const reprocessDialogRef = useRef<HTMLDivElement>(null)
   const cancelReprocessRef = useRef<HTMLButtonElement>(null)
@@ -41,17 +42,26 @@ export function ProcessingPage() {
     },
   })
   const retryMutation = useMutation({
-    mutationFn: api.retryJob,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["jobs", semesterId] }),
+    mutationFn: ({ jobId }: { jobId: string; semesterId: string }) => api.retryJob(jobId),
+    onMutate: () => setRetryFailure(null),
+    onError: (error, variables) => {
+      setRetryFailure({
+        semesterId: variables.semesterId,
+        jobId: variables.jobId,
+        message: error instanceof Error ? error.message : "The retry could not be started.",
+      })
+    },
+    onSuccess: (_data, variables) => queryClient.invalidateQueries({ queryKey: ["jobs", variables.semesterId] }),
   })
   const reprocessMutation = useMutation({
-    mutationFn: api.reprocessJob,
-    onSuccess: async () => {
+    mutationFn: ({ jobId }: { jobId: string; semesterId: string }) => api.reprocessJob(jobId),
+    onSuccess: async (_data, variables) => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["jobs", semesterId] }),
-        queryClient.invalidateQueries({ queryKey: ["review", semesterId] }),
+        queryClient.invalidateQueries({ queryKey: ["jobs", variables.semesterId] }),
+        queryClient.invalidateQueries({ queryKey: ["review", variables.semesterId] }),
+        queryClient.invalidateQueries({ queryKey: ["events", variables.semesterId] }),
       ])
-      closeReprocessDialog()
+      closeReprocessDialog(true)
     },
   })
 
@@ -59,14 +69,22 @@ export function ProcessingPage() {
     if (jobPendingReprocess) cancelReprocessRef.current?.focus()
   }, [jobPendingReprocess])
 
+  useEffect(() => {
+    if (!semesterId) {
+      setRetryFailure(null)
+      return
+    }
+    setRetryFailure((current) => (current?.semesterId === semesterId ? current : null))
+  }, [semesterId])
+
   function openReprocessDialog(job: ProcessingJob) {
     reprocessTriggerRef.current = document.activeElement as HTMLElement | null
     reprocessMutation.reset()
     setJobPendingReprocess(job)
   }
 
-  function closeReprocessDialog() {
-    if (reprocessMutation.isPending) return
+  function closeReprocessDialog(force = false) {
+    if (reprocessMutation.isPending && !force) return
     setJobPendingReprocess(null)
     requestAnimationFrame(() => reprocessTriggerRef.current?.focus())
   }
@@ -96,6 +114,7 @@ export function ProcessingPage() {
   }
 
   if (!semesterId) return <Navigate replace to="/setup" />
+  const activeSemesterId = semesterId
 
   const jobs = jobsQuery.data ?? []
   const working = jobs.some((job) => activeStatuses.has(job.status))
@@ -106,19 +125,28 @@ export function ProcessingPage() {
   const completedCount = jobs.filter((job) => job.status === "completed").length
   const failedCount = jobs.filter((job) => job.status === "failed").length
   const currentStep = allCompleted ? 4 : needsReview ? 3 : 2
+  const pageTitle = working ? "Reading your course plans" : failedCount > 0 ? "Some files need attention" : "Your files are ready"
 
   return (
     <AppShell currentStep={currentStep}>
       <div className="mx-auto max-w-5xl">
         <PageIntro
           eyebrow="Processing"
-          title={working ? "Reading your course plans" : "Your files are ready"}
+          title={pageTitle}
           description="Status is shown by real processing stage. This page refreshes each file independently."
         />
 
         {jobsQuery.isLoading ? <LoadingState label="Checking your files" /> : null}
         {jobsQuery.error ? (
           <ErrorState message={jobsQuery.error.message} onRetry={() => jobsQuery.refetch()} />
+        ) : null}
+        {retryFailure && retryFailure.semesterId === semesterId ? (
+          <div className="mb-5">
+            <ErrorState
+              message={retryFailure.message}
+              onRetry={() => retryMutation.mutate({ jobId: retryFailure.jobId, semesterId: activeSemesterId })}
+            />
+          </div>
         ) : null}
         {!jobsQuery.isLoading && !jobsQuery.error && !jobs.length ? (
           <Card className="border-border/80 bg-panel/95 p-6 text-center">
@@ -167,10 +195,10 @@ export function ProcessingPage() {
             <JobCard
               key={job.id}
               job={job}
-              onRetry={(jobId) => retryMutation.mutate(jobId)}
+              onRetry={(jobId) => retryMutation.mutate({ jobId, semesterId: activeSemesterId })}
               onReprocess={() => openReprocessDialog(job)}
-              retrying={retryMutation.isPending && retryMutation.variables === job.id}
-              reprocessing={reprocessMutation.isPending && reprocessMutation.variables === job.id}
+              retrying={retryMutation.isPending && retryMutation.variables?.jobId === job.id}
+              reprocessing={reprocessMutation.isPending && reprocessMutation.variables?.jobId === job.id}
             />
           ))}
         </div>
@@ -227,7 +255,7 @@ export function ProcessingPage() {
               ) : null}
               <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
                 <Button
-                  onClick={closeReprocessDialog}
+                  onClick={() => closeReprocessDialog()}
                   ref={cancelReprocessRef}
                   type="button"
                   variant="secondary"
@@ -236,7 +264,7 @@ export function ProcessingPage() {
                 </Button>
                 <Button
                   loading={reprocessMutation.isPending}
-                  onClick={() => reprocessMutation.mutate(jobPendingReprocess.id)}
+                  onClick={() => reprocessMutation.mutate({ jobId: jobPendingReprocess.id, semesterId: activeSemesterId })}
                   type="button"
                 >
                   Run extraction again
