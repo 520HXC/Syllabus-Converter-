@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
 from collections.abc import Callable, Collection
 from datetime import UTC, date, datetime, time
+from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -11,12 +14,14 @@ import pytesseract
 from dateutil import parser as date_parser
 from openai import OpenAI
 from pdf2image import convert_from_bytes
+from pdf2image.exceptions import PDFInfoNotInstalledError
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from .config import Settings, get_settings
 from .database import configure_database
+from .event_deduplication import deduplicate_summary_events
 from .models import (
     ConfidenceLevel,
     Course,
@@ -27,6 +32,7 @@ from .models import (
     ReviewStatus,
     SyllabusDocument,
 )
+from .source_times import clock_conflict, normalize_source_clock
 from .storage import StorageService
 
 COURSE_COLORS = ["#0D9488", "#2563EB", "#7C3AED", "#DB2777", "#D97706", "#059669"]
@@ -39,6 +45,7 @@ RETRYABLE_TERRA_CODES = {
     "SOURCE_MISMATCH",
     "SOURCE_PAGE_MISSING",
     "DATE_CONFLICT",
+    "TIME_CONFLICT",
     "RECURRING_RULE_MISSING",
     "ANCHOR_NOT_FOUND",
 }
@@ -49,7 +56,8 @@ RETRYABLE_TERRA_CODE_ORDER = {
     "DATE_CONFLICT": 3,
     "RECURRING_RULE_MISSING": 4,
     "ANCHOR_NOT_FOUND": 5,
-    "TERRA_RETRY_FAILED": 6,
+    "TIME_CONFLICT": 6,
+    "TERRA_RETRY_FAILED": 7,
 }
 AMBIGUOUS_RECURRENCE_PATTERN = re.compile(
     r"\b(?:nearly every|usually|periodically)\b",
@@ -179,6 +187,7 @@ class ScheduleAnchor(BaseModel):
     exclusion_dates: list[date] = Field(default_factory=list)
     source_quote: str = Field(min_length=1)
     source_page: int = Field(ge=1)
+    derivation_summary: str | None = None
     occurrences: list[ScheduleOccurrence] = Field(default_factory=list)
 
 
@@ -199,6 +208,7 @@ class RecurringRule(BaseModel):
     exclusion_dates: list[date] = Field(default_factory=list)
     source_quote: str = Field(min_length=1)
     source_page: int = Field(ge=1)
+    derivation_summary: str | None = None
     confidence: ConfidenceLevel
     anchor_title: str | None = None
     offset_days: int | None = None
@@ -248,8 +258,19 @@ class SyllabusExtraction(BaseModel):
 
 
 def ocr_pdf_page(content: bytes, page_number: int, settings: Settings) -> str:
-    if settings.tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+    command = settings.tesseract_cmd or shutil.which("tesseract")
+    if not command:
+        locations = (
+            ("LOCALAPPDATA", Path("Programs/Tesseract-OCR/tesseract.exe")),
+            ("ProgramFiles", Path("Tesseract-OCR/tesseract.exe")),
+            ("ProgramFiles(x86)", Path("Tesseract-OCR/tesseract.exe")),
+        )
+        for variable, relative_path in locations:
+            root = os.environ.get(variable)
+            if root and (candidate := Path(root) / relative_path).is_file():
+                command = str(candidate)
+                break
+    pytesseract.pytesseract.tesseract_cmd = command or "tesseract"
     try:
         images = convert_from_bytes(
             content,
@@ -258,13 +279,29 @@ def ocr_pdf_page(content: bytes, page_number: int, settings: Settings) -> str:
             dpi=220,
             poppler_path=settings.pdf_poppler_path,
         )
-        if not images:
-            return ""
-        return pytesseract.image_to_string(images[0]).strip()
+    except (PDFInfoNotInstalledError, FileNotFoundError) as error:
+        raise RuntimeError(
+            "OCR could not run because Poppler was not found. "
+            "Install Poppler or set PDF_POPPLER_PATH, then retry this file."
+        ) from error
     except Exception as error:
         raise RuntimeError(
-            "OCR could not run. Install Tesseract and Poppler, then retry this file."
+            "OCR could not read this page. Check that the PDF is readable, then retry this file."
         ) from error
+    if not images:
+        return ""
+    try:
+        return pytesseract.image_to_string(images[0]).strip()
+    except pytesseract.TesseractNotFoundError as error:
+        raise RuntimeError(
+            "OCR could not run because Tesseract was not found. "
+            "Install Tesseract or set TESSERACT_CMD, then retry this file."
+        ) from error
+    except Exception as error:
+        raise RuntimeError(
+            "OCR could not read this page. Check that the PDF is readable, then retry this file."
+        ) from error
+
 
 
 def extract_pdf_pages(
@@ -378,6 +415,14 @@ def extract_with_openai(
             "the lecture, or Sunday following the lab does not identify every occurrence. "
             "Otherwise use expansion_mode exact. Use the page markers for source_page. "
             "Copy a short exact source_quote. Do not invent dates. "
+            "Return times in 24-hour HH:MM form, preserving source AM/PM. "
+            "Times are local to the semester timezone, without UTC offsets. "
+            "Put a range's beginning in start_time and its ending in end_time; "
+            "never put a range or a timezone suffix in either field. "
+            "For example 11:59 PM is 23:59, 2-4 PM is 14:00-16:00, "
+            "12 AM is 00:00 and 12 PM is 12:00. Include the time in its source quote "
+            "when possible. Apply universal assignment deadlines only to their stated "
+            "assessment scope and preserve explicit exceptions such as exams. "
             "Mark whether the source explicitly states the year. "
             "Use low confidence and explain uncertainty whenever wording is tentative "
             "or conflicting."
@@ -567,9 +612,12 @@ def _ordered_retryable_codes(items: list[str]) -> list[str]:
     )
 
 
-def _rule_summary(rule: RecurringRule) -> str:
+def _rule_summary(rule: RecurringRule, range_start: date, range_end: date) -> str:
     if rule.rule_kind == "weekly_fixed":
-        return f"Every {rule.weekday} between {rule.boundary_start} and {rule.boundary_end}"
+        summary = f"Every {rule.weekday} between {range_start} and {range_end}"
+        if rule.boundary_start is None or rule.boundary_end is None:
+            summary += " (using semester boundaries where syllabus bounds are missing)"
+        return summary
     offset = rule.offset_days or 0
     anchor_title = rule.anchor_title or "anchor"
     return f"{offset} day(s) after {anchor_title}"
@@ -640,6 +688,14 @@ def _validate_rule(
     ):
         codes.append("ANCHOR_NOT_FOUND")
         reasons.append("The recurring rule refers to a schedule anchor that could not be matched.")
+    time_conflicts = [clock_conflict(rule, pages)]
+    if rule.rule_kind == "relative_to_anchor" and rule.anchor_title:
+        time_conflicts.extend(
+            clock_conflict(anchor, pages) for anchor in _find_matching_anchors(rule, anchors)
+        )
+    if any(time_conflicts):
+        codes.append("TIME_CONFLICT")
+        reasons.extend(reason for reason in time_conflicts if reason)
     return codes, " ".join(dict.fromkeys(reasons)) or None
 
 
@@ -720,6 +776,7 @@ def _build_rule_payload(rule: RecurringRule) -> dict:
         "anchor_title": rule.anchor_title,
         "offset_days": rule.offset_days,
         "expansion_mode": rule.expansion_mode,
+        "derivation_summary": rule.derivation_summary,
     }
 
 
@@ -932,6 +989,18 @@ def _is_non_actionable_section_meeting_quote(source_quote: str) -> bool:
         SECTION_MEETING_TIME_PATTERN.search(source_quote)
         or STRUCTURAL_CLASS_REFERENCE_PATTERN.search(source_quote)
         or STRUCTURAL_SECTION_DESCRIPTION_PATTERN.search(source_quote)
+        or re.search(
+            r"^\s*(?:lectures?|labs?|class(?:es)?|discussions?)\s*:\s*"
+            r"(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|"
+            r"fri(?:day)?|sat(?:urday)?|sun(?:day)?|mwf|mw|wf|tr|tu|th|sa|su|[mtwf])\b",
+            source_quote,
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(?:class|lecture|lab|discussion)\s+schedule(?:\s+and\s+location)?\s*:",
+            source_quote,
+            re.IGNORECASE,
+        )
     )
     has_explicit_weekly = bool(EXPLICIT_WEEKLY_SOURCE_PATTERN.search(source_quote))
     has_explicit_boundary = bool(EXPLICIT_SOURCE_BOUNDARY_PATTERN.search(source_quote))
@@ -1487,6 +1556,52 @@ def _materialize_missing_ambiguous_review_events(
             known_titles.add(_stable_title_key("Lab assignment make-up deadline"))
             known_title_phrases.update(LAB_MAKEUP_TITLE_ALIASES)
 
+    has_quiz_assessment = any(
+        item.event_type == "quiz"
+        or (
+            item.event_type != "class"
+            and re.search(r"\bquiz(?:zes)?\b", item.title, re.IGNORECASE)
+        )
+        for item in [*events, *extraction.recurring_rules]
+    )
+    if not has_quiz_assessment:
+        graded_quiz_heading = re.compile(
+            r"^[ \t]*quiz(?:zes)?\s*(?:\(\s*)?"
+            r"(?P<weight>\d+(?:\.\d+)?)\s*%[ \t]*\)?",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        for page in pages:
+            match = next(
+                (
+                    item for item in graded_quiz_heading.finditer(page["text"])
+                    if 0 < float(item.group("weight")) <= 100
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            events.append(
+                CandidateEvent(
+                    title="Quizzes",
+                    event_type="quiz",
+                    event_date=None,
+                    start_time=None,
+                    end_time=None,
+                    is_all_day=True,
+                    source_quote=re.sub(r"\s+", " ", match.group(0)).strip(),
+                    source_page=page["page"],
+                    confidence=ConfidenceLevel.MEDIUM,
+                    year_was_explicit=False,
+                    uncertainty_reason=(
+                        "The syllabus lists graded quizzes without individual dates."
+                    ),
+                    extraction_model=extraction_model,
+                    derivation_summary=REVIEW_ONLY_DERIVATION_SUMMARY,
+                    review_status=ReviewStatus.NEEDS_REVIEW,
+                )
+            )
+            break
+
     return extraction.model_copy(update={"events": events})
 
 
@@ -1553,6 +1668,7 @@ def expand_recurring_rules(
                         "exclusion_dates": [item.isoformat() for item in anchor.exclusion_dates],
                         "source_quote": anchor.source_quote,
                         "source_page": anchor.source_page,
+                        "derivation_summary": anchor.derivation_summary,
                         "occurrences": [
                             occurrence.model_dump(mode="json")
                             for occurrence in anchor.occurrences
@@ -1582,7 +1698,7 @@ def expand_recurring_rules(
             truncated = True
 
         series_id = uuid4()
-        summary = _rule_summary(rule)
+        summary = _rule_summary(rule, range_start, range_end)
         warning_codes: list[str] = []
         warning_reason: str | None = None
         if truncated:
@@ -1737,6 +1853,9 @@ def _parse_repair_with_openai(
             model=settings.openai_fallback_model,
             instructions=(
                 "Repair only the extracted items that failed deterministic validation. "
+                "Preserve source AM/PM when returning 24-hour times. A TIME_CONFLICT "
+                "requires matching this particular assessment to its own source time "
+                "or explicitly applicable deadline rule, never another item or office hours. "
                 f"Focus on these warning codes {repair_summary}. "
                 "Keep other validated Luna items unchanged. Explicitly recover missing "
                 "schedule anchors or recurring rules when the validation notes say they are "
@@ -1778,12 +1897,47 @@ def _merge_extractions(
         for index, event in enumerate(primary.events)
         if index not in flagged_event_indexes
     ]
-    if repair.events:
-        merged_events.extend(repair.events)
-    else:
-        merged_events.extend(
-            primary.events[index].model_copy(deep=True) for index in sorted(flagged_event_indexes)
-        )
+    # A repair can repeat items outside its requested scope. Preserve validated
+    # primary values and compare canonical title plus date, never date alone.
+    protected_event_keys = {
+        (_normalize_title(_canonicalize_event_identity(event).title), event.event_date)
+        for event in merged_events
+    }
+    repaired_events = [
+        event
+        for event in repair.events
+        if (_normalize_title(_canonicalize_event_identity(event).title), event.event_date)
+        not in protected_event_keys
+    ]
+    replaced_event_indexes: set[int] = set()
+    for repaired_event in repaired_events:
+        repaired_title = _normalize_title(_canonicalize_event_identity(repaired_event).title)
+        matches = [
+            index for index in flagged_event_indexes
+            if _normalize_title(_canonicalize_event_identity(primary.events[index]).title)
+            == repaired_title
+        ]
+        if len(matches) > 1:
+            matches = [
+                index for index in matches
+                if primary.events[index].event_date == repaired_event.event_date
+            ]
+        elif not matches:
+            # A repair may correct a misleading title. Only an exact, uniquely
+            # shared source excerpt can establish that renamed item's identity.
+            matches = [
+                index for index in flagged_event_indexes
+                if primary.events[index].source_page == repaired_event.source_page
+                and _normalize_evidence(primary.events[index].source_quote)
+                == _normalize_evidence(repaired_event.source_quote)
+            ]
+        if len(matches) == 1:
+            replaced_event_indexes.add(matches[0])
+    merged_events.extend(repaired_events)
+    merged_events.extend(
+        primary.events[index].model_copy(deep=True)
+        for index in sorted(flagged_event_indexes - replaced_event_indexes)
+    )
 
     merged_rules = [
         rule.model_copy(deep=True)
@@ -2232,7 +2386,18 @@ def _normalize_explicit_source_event_dates(
             update["uncertainty_reason"] = None
             update["derivation_summary"] = None
         normalized_events.append(candidate.model_copy(update=update) if update else candidate)
-    return extraction.model_copy(update={"events": normalized_events})
+    return extraction.model_copy(
+        update={
+            "events": [normalize_source_clock(event, pages or []) for event in normalized_events],
+            "recurring_rules": [
+                normalize_source_clock(rule, pages or []) for rule in extraction.recurring_rules
+            ],
+            "schedule_anchors": [
+                normalize_source_clock(anchor, pages or [])
+                for anchor in extraction.schedule_anchors
+            ],
+        }
+    )
 
 
 def validate_candidate(
@@ -2276,6 +2441,11 @@ def validate_candidate(
     ):
         codes.append("SOURCE_MISMATCH")
         reasons.append("The source quote could not be matched to the cited page.")
+
+    time_conflict = clock_conflict(candidate, pages)
+    if time_conflict:
+        codes.append("TIME_CONFLICT")
+        reasons.append(time_conflict)
 
     if candidate.confidence == ConfidenceLevel.LOW:
         codes.append("LOW_CONFIDENCE")
@@ -2383,6 +2553,15 @@ def process_job(
             extraction, ambiguous_event_indexes, ambiguous_warning_reason = (
                 _normalize_ambiguous_recurring_content(extraction, pages)
             )
+            deduplicated_events, retained_indexes = deduplicate_summary_events(
+                extraction.events, pages
+            )
+            extraction = extraction.model_copy(update={"events": deduplicated_events})
+            ambiguous_event_indexes = {
+                retained_indexes[index]
+                for index in ambiguous_event_indexes
+                if index in retained_indexes
+            }
             extraction = _normalize_explicit_source_event_dates(
                 extraction,
                 job.document.semester.start_date,
@@ -2504,7 +2683,12 @@ def process_job(
                     )
                 if is_primary_event and candidate_index in ambiguous_event_indexes:
                     warning_codes.append("AMBIGUOUS_RECURRENCE")
-                    warning_reason = ambiguous_warning_reason
+                    if "TIME_CONFLICT" in warning_codes:
+                        warning_reason = " ".join(dict.fromkeys(
+                            part for part in (warning_reason, ambiguous_warning_reason) if part
+                        )) or None
+                    else:
+                        warning_reason = ambiguous_warning_reason
                 duplicate_key = (normalized_title, candidate.event_date)
                 if duplicate_key in seen:
                     warning_codes.append("POSSIBLE_DUPLICATE")
@@ -2544,6 +2728,19 @@ def process_job(
                             for part in [series_payload.warning_reason, warning_reason]
                             if part
                         ) or None
+                # TIME_CONFLICT above retains the original offset in its reason.
+                # SQL TIME columns discard offsets, so unresolved values must not
+                # silently become plausible local clock times during persistence.
+                invalid_clock_fields = {
+                    field: None
+                    for field in ("start_time", "end_time")
+                    if getattr(candidate, field) is not None
+                    and getattr(candidate, field).tzinfo is not None
+                }
+                if invalid_clock_fields:
+                    candidate = candidate.model_copy(update=invalid_clock_fields)
+                    if candidate.start_time is None and candidate.end_time is None:
+                        candidate = candidate.model_copy(update={"is_all_day": True})
                 session.add(
                     ExtractedEvent(
                         user_id=job.user_id,

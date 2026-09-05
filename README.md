@@ -163,6 +163,19 @@ MAX_EXTRACTED_TEXT_CHARACTERS=500000
 
 Restart the API after changing the environment. Never commit an API key or place it in a frontend `VITE_` variable.
 
+### Scanned PDFs on Windows
+
+Scanned pages need [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) and Poppler in addition to the Python packages. The Docker image already installs both.
+
+The local API finds Tesseract on PATH or in the standard per-user and Program Files installation folders. Custom installations can use the existing overrides in `backend/.env`.
+
+```dotenv
+TESSERACT_CMD=C:/path/to/Tesseract-OCR/tesseract.exe
+PDF_POPPLER_PATH=C:/path/to/poppler/bin
+```
+
+Use the Poppler folder containing both `pdfinfo.exe` and `pdftoppm.exe`. Restart the API after changing these overrides. If a dependency is unavailable, the failed job names the missing dependency and can be retried after setup.
+
 ## Processing states
 
 Every uploaded document moves independently through these states
