@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
 from collections.abc import Callable, Collection
 from datetime import UTC, date, datetime, time
 from pathlib import Path
+from time import monotonic
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -14,14 +16,21 @@ import pytesseract
 from dateutil import parser as date_parser
 from openai import OpenAI
 from pdf2image import convert_from_bytes
-from pdf2image.exceptions import PDFInfoNotInstalledError
+from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPopplerTimeoutError
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from .config import Settings, get_settings
 from .database import configure_database
+from .errors import SafeProcessingError, log_processing_failure
 from .event_deduplication import deduplicate_summary_events
+from .job_execution import (
+    StaleJobExecution,
+    claim_job,
+    fail_job_execution,
+    fence_job_execution,
+)
 from .models import (
     ConfidenceLevel,
     Course,
@@ -278,29 +287,44 @@ def ocr_pdf_page(content: bytes, page_number: int, settings: Settings) -> str:
             last_page=page_number,
             dpi=220,
             poppler_path=settings.pdf_poppler_path,
+            size=settings.max_ocr_dimension_pixels,
+            timeout=settings.pdf_render_timeout_seconds,
         )
+    except PDFPopplerTimeoutError as error:
+        raise SafeProcessingError(
+            "OCR page rendering exceeded its time limit. Try a simpler PDF."
+        ) from error
     except (PDFInfoNotInstalledError, FileNotFoundError) as error:
-        raise RuntimeError(
+        raise SafeProcessingError(
             "OCR could not run because Poppler was not found. "
             "Install Poppler or set PDF_POPPLER_PATH, then retry this file."
         ) from error
     except Exception as error:
-        raise RuntimeError(
+        raise SafeProcessingError(
             "OCR could not read this page. Check that the PDF is readable, then retry this file."
         ) from error
     if not images:
         return ""
     try:
-        return pytesseract.image_to_string(images[0]).strip()
+        if any(max(image.size) > settings.max_ocr_dimension_pixels for image in images):
+            raise SafeProcessingError("OCR page rendering exceeded its image size limit.")
+        return pytesseract.image_to_string(
+            images[0], timeout=settings.ocr_timeout_seconds
+        ).strip()
+    except SafeProcessingError:
+        raise
     except pytesseract.TesseractNotFoundError as error:
-        raise RuntimeError(
+        raise SafeProcessingError(
             "OCR could not run because Tesseract was not found. "
             "Install Tesseract or set TESSERACT_CMD, then retry this file."
         ) from error
     except Exception as error:
-        raise RuntimeError(
+        raise SafeProcessingError(
             "OCR could not read this page. Check that the PDF is readable, then retry this file."
         ) from error
+    finally:
+        for image in images:
+            image.close()
 
 
 
@@ -311,6 +335,7 @@ def extract_pdf_pages(
     on_ocr_start: Callable[[int], None] | None = None,
 ) -> tuple[list[dict], bool]:
     settings = settings or get_settings()
+    deadline = monotonic() + settings.processing_timeout_seconds
     pages: list[dict] = []
     used_ocr = False
     try:
@@ -326,7 +351,20 @@ def extract_pdf_pages(
         ocr_page_count = 0
         extracted_character_count = 0
         for index, page in enumerate(document):
+            if monotonic() >= deadline:
+                raise SafeProcessingError(
+                    "PDF processing exceeded its time limit. Try a shorter PDF."
+                )
             page_number = index + 1
+            dimensions = (
+                page.rect.width, page.rect.height, page.mediabox.width, page.mediabox.height
+            )
+            if any(
+                not math.isfinite(value) or value <= 0
+                or value > settings.max_pdf_page_dimension_points
+                for value in dimensions
+            ):
+                raise ValueError("The PDF page dimensions exceed the supported limit.")
             embedded_text = page.get_text("text").strip()
             if len(embedded_text) >= min_text_characters:
                 page_text = embedded_text
@@ -343,6 +381,10 @@ def extract_pdf_pages(
                 used_page_ocr = True
                 used_ocr = True
                 ocr_page_count += 1
+            if monotonic() >= deadline:
+                raise SafeProcessingError(
+                    "PDF processing exceeded its time limit. Try a shorter PDF."
+                )
             extracted_character_count += len(page_text)
             if extracted_character_count > settings.max_extracted_text_characters:
                 raise ValueError(
@@ -372,7 +414,11 @@ def _parse_with_openai(
 ):
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is required when EXTRACTION_MODE is openai.")
-    client = OpenAI(api_key=settings.openai_api_key)
+    client = OpenAI(
+        api_key=settings.openai_api_key,
+        timeout=settings.openai_timeout_seconds,
+        max_retries=0,
+    )
     try:
         response = client.responses.parse(
             model=model,
@@ -380,6 +426,7 @@ def _parse_with_openai(
             input=_pages_for_prompt(pages),
             text_format=text_format,
             store=False,
+            max_output_tokens=settings.max_model_output_tokens,
         )
     except ValidationError as error:
         raise StructuredExtractionError(
@@ -1847,7 +1894,11 @@ def _parse_repair_with_openai(
     repair_summary = ", ".join(retryable_codes)
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is required when EXTRACTION_MODE is openai.")
-    client = OpenAI(api_key=settings.openai_api_key)
+    client = OpenAI(
+        api_key=settings.openai_api_key,
+        timeout=settings.openai_timeout_seconds,
+        max_retries=0,
+    )
     try:
         response = client.responses.parse(
             model=settings.openai_fallback_model,
@@ -1876,6 +1927,7 @@ def _parse_repair_with_openai(
             ),
             text_format=SyllabusRepair,
             store=False,
+            max_output_tokens=settings.max_model_output_tokens,
         )
     except ValidationError as error:
         raise StructuredExtractionError(
@@ -2456,7 +2508,11 @@ def validate_candidate(
     return codes, " ".join(dict.fromkeys(reasons)) or None
 
 
-def _update_job(session: Session, job: ProcessingJob, status: JobStatus, detail: str) -> None:
+def _update_job(
+    session: Session, job: ProcessingJob, status: JobStatus, detail: str,
+    *, execution_id: str,
+) -> None:
+    fence_job_execution(session, job.id, execution_id)
     job.status = status
     job.stage_detail = detail
     job.updated_at = datetime.now(UTC)
@@ -2467,14 +2523,29 @@ def process_job(
     job_id: str,
     settings: Settings | None = None,
     session_factory: sessionmaker[Session] | None = None,
+    execution_id: str | None = None,
 ) -> None:
     settings = settings or get_settings()
     if session_factory is None:
         _, session_factory = configure_database(settings.database_url)
 
     job_uuid = UUID(job_id)
+    if execution_id is None:
+        # Direct/manual callers can adopt the currently queued generation.
+        # Celery always supplies its reserved task id, so delayed deliveries
+        # never adopt a newer generation.
+        with session_factory() as session:
+            execution_id = session.scalar(
+                select(ProcessingJob.execution_id).where(
+                    ProcessingJob.id == job_uuid, ProcessingJob.status == JobStatus.QUEUED,
+                )
+            ) or str(uuid4())
+    claimed = False
     try:
         with session_factory() as session:
+            claimed = claim_job(session, job_uuid, execution_id)
+            if not claimed:
+                return
             job = session.scalar(
                 select(ProcessingJob)
                 .options(
@@ -2484,8 +2555,6 @@ def process_job(
             )
             if job is None:
                 return
-            job.attempts += 1
-            _update_job(session, job, JobStatus.EXTRACTING_TEXT, "Reading text from the PDF")
 
             content = StorageService(settings).read(job.document.storage_key)
             pages, used_ocr = extract_pdf_pages(
@@ -2497,13 +2566,20 @@ def process_job(
                     job,
                     JobStatus.RUNNING_OCR,
                     f"Running OCR on page {page_number}",
+                    execution_id=execution_id,
                 ),
             )
             if used_ocr:
-                _update_job(session, job, JobStatus.RUNNING_OCR, "OCR completed for scanned pages")
+                _update_job(
+                    session, job, JobStatus.RUNNING_OCR, "OCR completed for scanned pages",
+                    execution_id=execution_id,
+                )
             job.document.extracted_pages = pages
             job.document.used_ocr = used_ocr
-            _update_job(session, job, JobStatus.EXTRACTING_EVENTS, "Extracting course dates")
+            _update_job(
+                session, job, JobStatus.EXTRACTING_EVENTS, "Extracting course dates",
+                execution_id=execution_id,
+            )
             known_dates_by_title: dict[str, set[date]] = {}
             other_events = session.execute(
                 select(ExtractedEvent.title, ExtractedEvent.event_date).where(
@@ -2570,7 +2646,14 @@ def process_job(
             )
             job.fallback_used = fallback_used
             job.fallback_reason_codes = fallback_reason_codes
-            _update_job(session, job, JobStatus.VALIDATING, "Checking dates and source evidence")
+            _update_job(
+                session, job, JobStatus.VALIDATING, "Checking dates and source evidence",
+                execution_id=execution_id,
+            )
+
+            # Keep the ownership row locked through all event/course replacement
+            # writes and the final commit. A timeout/retry cannot interleave.
+            fence_job_execution(session, job_uuid, execution_id)
 
             session.execute(
                 delete(ExtractedEvent).where(ExtractedEvent.document_id == job.document_id)
@@ -2772,12 +2855,9 @@ def process_job(
             job.error_message = None
             job.completed_at = None
             session.commit()
+    except StaleJobExecution:
+        return
     except Exception as error:
-        with session_factory() as session:
-            job = session.get(ProcessingJob, job_uuid)
-            if job is not None:
-                job.status = JobStatus.FAILED
-                job.stage_detail = "Processing failed"
-                job.error_message = str(error)[:2000]
-                job.updated_at = datetime.now(UTC)
-                session.commit()
+        log_processing_failure(job_id, error)
+        if claimed:
+            fail_job_execution(session_factory, job_uuid, execution_id, error)

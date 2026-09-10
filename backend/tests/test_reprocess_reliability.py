@@ -413,7 +413,7 @@ def test_reprocess_dispatch_failure_preserves_previous_completion_and_review_dat
     app.state.settings.processing_mode = "worker"
     write_pdf(app, storage_key, make_pdf("CS 101 Midterm exam October 14, 2026. " * 8))
 
-    def fail_dispatch(job_id, settings):
+    def fail_dispatch(job_id, settings, **kwargs):
         raise RuntimeError("queue unavailable")
 
     monkeypatch.setattr("app.api.dispatch_job", fail_dispatch)
@@ -457,7 +457,7 @@ def test_retry_dispatch_failure_preserves_previous_completion_after_failed_rerun
         job.error_message = "earlier rerun failed"
         session.commit()
 
-    def fail_dispatch(job_id, settings):
+    def fail_dispatch(job_id, settings, **kwargs):
         raise RuntimeError("queue unavailable")
 
     monkeypatch.setattr("app.api.dispatch_job", fail_dispatch)

@@ -4,7 +4,18 @@ import uuid
 from datetime import UTC, date, datetime, time
 from enum import StrEnum
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Enum, ForeignKey, String, Text, Time
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    String,
+    Text,
+    Time,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -144,6 +155,7 @@ class ProcessingJob(Base):
     stage_detail: Mapped[str | None] = mapped_column(String(240))
     error_message: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(default=0)
+    execution_id: Mapped[str | None] = mapped_column(String(36))
     primary_model: Mapped[str | None] = mapped_column(String(80))
     fallback_model: Mapped[str | None] = mapped_column(String(80))
     fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -155,6 +167,15 @@ class ProcessingJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     document: Mapped[SyllabusDocument] = relationship(back_populates="job")
+
+
+class ProcessingQuota(Base):
+    """Backend-only admission counters, independent of deletable user content."""
+
+    __tablename__ = "processing_quotas"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
 class RecurringEventSeries(Base):

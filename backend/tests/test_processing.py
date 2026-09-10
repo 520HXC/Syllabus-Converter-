@@ -11,6 +11,7 @@ import pytest
 import app.processing as processing
 from app.api import safe_filename
 from app.config import Settings
+from app.errors import PROCESSING_FAILED_MESSAGE
 from app.models import (
     JobStatus,
     ProcessingJob,
@@ -784,7 +785,7 @@ def test_openai_extraction_defaults_to_luna_and_excludes_routine_classes(monkeyp
             return SimpleNamespace(output_parsed=output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             assert api_key == "test-key"
             self.responses = FakeResponses()
 
@@ -913,7 +914,7 @@ def test_process_job_repairs_only_retryable_luna_warnings_with_single_terra_call
             return SimpleNamespace(output_parsed=terra_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             assert api_key == "test-key"
             self.responses = FakeResponses()
 
@@ -1032,7 +1033,7 @@ def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_
             return SimpleNamespace(output_parsed=output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             assert api_key == "test-key"
             self.responses = FakeResponses()
 
@@ -1169,7 +1170,7 @@ def test_process_job_skips_terra_when_warnings_are_not_retryable(app_client, mon
             return SimpleNamespace(output_parsed=output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -1262,7 +1263,7 @@ def test_date_missing_alone_does_not_trigger_terra_retry(app_client, monkeypatch
             return SimpleNamespace(output_parsed=output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -1361,7 +1362,7 @@ def test_process_job_marks_terra_retry_failed_and_keeps_luna_events(app_client, 
     fake_responses = FakeResponses()
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = fake_responses
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -1434,7 +1435,7 @@ def test_process_job_does_not_fallback_on_luna_operational_failure(app_client, m
             raise TimeoutError("Luna timed out")
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -1452,7 +1453,7 @@ def test_process_job_does_not_fallback_on_luna_operational_failure(app_client, m
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.FAILED
-        assert persisted.error_message == "Luna timed out"
+        assert persisted.error_message == PROCESSING_FAILED_MESSAGE
         assert persisted.fallback_used is False
 
     assert calls == ["gpt-5.6-luna"]
@@ -1525,7 +1526,7 @@ def test_process_job_fails_on_terra_repair_operational_failure(app_client, monke
             raise TimeoutError("Terra timed out")
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -1543,7 +1544,7 @@ def test_process_job_fails_on_terra_repair_operational_failure(app_client, monke
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.FAILED
-        assert persisted.error_message == "Terra timed out"
+        assert persisted.error_message == PROCESSING_FAILED_MESSAGE
 
     assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
 
@@ -1590,7 +1591,7 @@ def test_process_job_fails_when_both_models_cannot_parse_structured_output(app_c
             return SimpleNamespace(output_parsed=None)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -1608,7 +1609,7 @@ def test_process_job_fails_when_both_models_cannot_parse_structured_output(app_c
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.FAILED
-        assert "structured syllabus extraction" in persisted.error_message
+        assert persisted.error_message == PROCESSING_FAILED_MESSAGE
 
 
 def test_expand_recurring_rules_uses_explicit_irregular_anchor_occurrences_for_exact_rules():
@@ -1811,7 +1812,7 @@ def test_process_job_normalizes_ambiguous_recurring_candidate_without_duplicatio
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -1933,7 +1934,7 @@ def test_process_job_uses_single_terra_call_for_missing_deterministic_recurring_
             return SimpleNamespace(output_parsed=terra_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -2034,7 +2035,7 @@ def test_process_job_does_not_trigger_terra_for_ambiguous_recurring_standalone_c
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -2175,7 +2176,7 @@ def test_process_job_merges_multiple_fallback_reasons_into_one_terra_call(
             return SimpleNamespace(output_parsed=terra_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -2222,7 +2223,7 @@ def test_openai_extraction_instructions_request_schedule_occurrences_and_review_
             return SimpleNamespace(output_parsed=output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -3285,7 +3286,7 @@ def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -3390,7 +3391,7 @@ def test_process_job_materializes_review_only_rule_without_existing_event(
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -3512,7 +3513,7 @@ def test_process_job_only_marks_related_relative_no_date_event_as_ambiguous(
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -3678,7 +3679,7 @@ def test_process_job_marks_unresolved_deterministic_rule_after_single_terra_repa
             return SimpleNamespace(output_parsed=terra_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -3878,7 +3879,7 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -4010,7 +4011,7 @@ def test_process_job_filters_non_actionable_course_structure_lab_entry(
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -4438,7 +4439,7 @@ def test_process_job_review_only_relative_rule_without_anchor_skips_terra(app_cl
             return SimpleNamespace(output_parsed=luna_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)
@@ -4548,7 +4549,7 @@ def test_process_job_materializes_unresolved_exact_relative_rule_without_anchor(
             return SimpleNamespace(output_parsed=terra_output)
 
     class FakeOpenAI:
-        def __init__(self, api_key):
+        def __init__(self, api_key, **kwargs):
             self.responses = FakeResponses()
 
     monkeypatch.setattr("app.processing.OpenAI", FakeOpenAI)

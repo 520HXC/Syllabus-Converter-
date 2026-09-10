@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api import router
 from .config import get_settings
 from .database import Base, configure_database
+from .upload_body import UploadBodyLimitMiddleware
 
 
 def create_app() -> FastAPI:
@@ -22,6 +23,7 @@ def create_app() -> FastAPI:
     )
     application.state.session_factory = session_factory
     application.state.settings = settings
+    application.add_middleware(UploadBodyLimitMiddleware, settings=settings)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { AlertTriangle, CalendarRange, Check, ChevronDown, Clock3, RotateCcw, Trash2 } from "lucide-react"
 
 import type { EventUpdate, ExtractedEvent, RecurringEventSeries, ReviewStatus } from "../lib/types"
@@ -38,6 +38,9 @@ export function RecurringSeriesCard({
 }) {
   const [expanded, setExpanded] = useState(false)
   const [saving, setSaving] = useState<SeriesAction | null>(null)
+  const [savingOccurrences, setSavingOccurrences] = useState(false)
+  const activeEventSaves = useRef(0)
+  const seriesSaveInProgress = useRef(false)
   const [error, setError] = useState<string | null>(null)
   const showOccurrences = expanded || Boolean(focusEventId)
   const fallbackReasons = formatFallbackReasons(series.fallback_reason_codes ?? [])
@@ -47,6 +50,8 @@ export function RecurringSeriesCard({
   }, [focusEventId])
 
   async function save(reviewStatus: SeriesAction) {
+    if (activeEventSaves.current > 0 || seriesSaveInProgress.current) return
+    seriesSaveInProgress.current = true
     setSaving(reviewStatus)
     setError(null)
     try {
@@ -54,9 +59,24 @@ export function RecurringSeriesCard({
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The series could not be saved.")
     } finally {
+      seriesSaveInProgress.current = false
       setSaving(null)
     }
   }
+
+  async function saveOccurrence(eventId: string, update: EventUpdate) {
+    if (seriesSaveInProgress.current) throw new Error("Wait for the series to finish saving.")
+    activeEventSaves.current += 1
+    setSavingOccurrences(true)
+    try {
+      await onSaveEvent(eventId, update)
+    } finally {
+      activeEventSaves.current -= 1
+      if (activeEventSaves.current === 0) setSavingOccurrences(false)
+    }
+  }
+
+  const seriesActionsDisabled = savingOccurrences || saving !== null
 
   return (
     <Card
@@ -123,21 +143,21 @@ export function RecurringSeriesCard({
 
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
             {series.review_status === "ignored" ? (
-              <Button loading={saving === "needs_review"} onClick={() => void save("needs_review")} variant="secondary">
+              <Button disabled={seriesActionsDisabled} loading={saving === "needs_review"} onClick={() => void save("needs_review")} variant="secondary">
                 <RotateCcw aria-hidden="true" className="size-4" />
                 Restore series
               </Button>
             ) : (
               <>
-                <Button loading={saving === "confirmed"} onClick={() => void save("confirmed")}>
+                <Button disabled={seriesActionsDisabled} loading={saving === "confirmed"} onClick={() => void save("confirmed")}>
                   <Check aria-hidden="true" className="size-4" />
                   Confirm series
                 </Button>
-                <Button loading={saving === "pending"} onClick={() => void save("pending")} variant="secondary">
+                <Button disabled={seriesActionsDisabled} loading={saving === "pending"} onClick={() => void save("pending")} variant="secondary">
                   <Clock3 aria-hidden="true" className="size-4" />
                   Keep pending
                 </Button>
-                <Button loading={saving === "ignored"} onClick={() => void save("ignored")} variant="danger">
+                <Button disabled={seriesActionsDisabled} loading={saving === "ignored"} onClick={() => void save("ignored")} variant="danger">
                   <Trash2 aria-hidden="true" className="size-4" />
                   Remove series
                 </Button>
@@ -157,18 +177,18 @@ export function RecurringSeriesCard({
       </div>
 
       {showOccurrences ? (
-        <div className="grid gap-4 border-t border-border/80 bg-panel-muted/20 p-4 sm:p-5">
+        <fieldset disabled={saving !== null} aria-label={`${series.title} dates`} className="grid min-w-0 gap-4 border-t border-border/80 bg-panel-muted/20 p-4 sm:p-5">
           {occurrences.map((event) => (
             <ReviewEventCard
               courseColor={courseColor}
               courseLabel={courseLabel}
               event={event}
               key={event.id}
-              onSave={onSaveEvent}
+              onSave={saveOccurrence}
               startEditing={focusEventId === event.id}
             />
           ))}
-        </div>
+        </fieldset>
       ) : null}
     </Card>
   )

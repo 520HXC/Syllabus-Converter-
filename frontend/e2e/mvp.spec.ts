@@ -397,15 +397,68 @@ test("reviews a recurring schedule once while preserving individual changes", as
   await expect(occurrenceCards).toHaveCount(13)
   await occurrenceCards.nth(1).getByRole("button", { name: "Modify Homework" }).click()
   await occurrenceCards.nth(1).getByLabel("Event date").fill("2026-09-12")
+  const confirmedOccurrence = page.waitForResponse((response) =>
+    response.url().includes("/api/extracted-events/") && response.request().method() === "PATCH" &&
+    response.request().postDataJSON().review_status === "confirmed" && response.ok(),
+  )
   await occurrenceCards.nth(1).getByRole("button", { name: "Confirm", exact: true }).click()
-  await occurrenceCards.first().getByRole("button", { name: "Remove", exact: true }).click()
+  await confirmedOccurrence
 
-  await series.getByRole("button", { name: "Confirm series" }).click()
+  let releaseRemoval!: () => void
+  const removalGate = new Promise<void>((resolve) => { releaseRemoval = resolve })
+  let removalStarted!: () => void
+  const removalRequestStarted = new Promise<void>((resolve) => { removalStarted = resolve })
+  await page.route("**/api/extracted-events/*", async (route) => {
+    if (route.request().method() === "PATCH" && route.request().postDataJSON().review_status === "ignored") {
+      removalStarted()
+      await removalGate
+    }
+    await route.continue()
+  })
+  const removedOccurrence = page.waitForResponse((response) =>
+    response.url().includes("/api/extracted-events/") && response.request().method() === "PATCH" &&
+    response.request().postDataJSON().review_status === "ignored" && response.ok(),
+  )
+  try {
+    await occurrenceCards.first().getByRole("button", { name: "Remove", exact: true }).click()
+    await removalRequestStarted
+    await expect(series.getByRole("button", { name: "Confirm series" })).toBeDisabled()
+    await expect(series.getByRole("button", { name: "Keep pending", exact: true })).toBeDisabled()
+  } finally {
+    releaseRemoval()
+  }
+  const removedEvent = await (await removedOccurrence).json()
+  expect(removedEvent.review_status).toBe("ignored")
+
+  let releaseSeries!: () => void
+  const seriesGate = new Promise<void>((resolve) => { releaseSeries = resolve })
+  let seriesStarted!: () => void
+  const seriesRequestStarted = new Promise<void>((resolve) => { seriesStarted = resolve })
+  await page.route("**/api/recurring-series/*", async (route) => {
+    if (route.request().method() === "PATCH") {
+      seriesStarted()
+      await seriesGate
+    }
+    await route.continue()
+  })
+  try {
+    await series.getByRole("button", { name: "Confirm series" }).click()
+    await seriesRequestStarted
+    await expect(series.getByRole("button", { name: "Modify Homework" }).first()).toBeDisabled()
+    await expect(series.getByRole("button", { name: "Remove series", exact: true })).toBeDisabled()
+  } finally {
+    releaseSeries()
+  }
   await expect(page.getByRole("button", { name: "Finish and open Calendar" })).toBeVisible()
   await page.getByRole("button", { name: "Finish and open Calendar" }).click()
 
   await page.getByRole("button", { name: "List", exact: true }).click()
   await expect(page).toHaveURL(/\/calendar\?view=list$/)
   await expect(page.getByRole("heading", { name: "September 12, 2026" })).toBeVisible()
-  await expect(page.getByRole("link", { name: /Homework/i })).toHaveCount(12)
+  // This week's summary may link to the same event again. Count actual list
+  // occurrences and separately ensure the removed date is absent everywhere.
+  await expect(page.getByRole("link", { name: /Homework/i }).filter({
+    has: page.getByTestId(/^calendar-course-rail-list-/),
+  })).toHaveCount(12)
+  await expect(page.locator(`a[href="/review?eventId=${removedEvent.id}"]`)).toHaveCount(0)
 })

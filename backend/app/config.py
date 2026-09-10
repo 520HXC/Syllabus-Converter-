@@ -35,6 +35,21 @@ class Settings(BaseSettings):
 
     max_upload_files: int = 10
     max_upload_bytes: int = 20 * 1024 * 1024
+    max_upload_total_bytes: int = Field(default=40 * 1024 * 1024, gt=0)
+    max_user_jobs_per_day: int = Field(default=20, gt=0)
+    max_global_jobs_per_day: int = Field(default=200, gt=0)
+    max_user_active_jobs: int = Field(default=10, gt=0)
+    max_global_active_jobs: int = Field(default=50, gt=0)
+    max_user_storage_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
+    max_global_storage_bytes: int = Field(default=5 * 1024 * 1024 * 1024, gt=0)
+    ocr_timeout_seconds: int = Field(default=30, gt=0)
+    pdf_render_timeout_seconds: int = Field(default=30, gt=0)
+    max_pdf_page_dimension_points: int = Field(default=1440, gt=0)
+    max_ocr_dimension_pixels: int = Field(default=4000, gt=0)
+    processing_timeout_seconds: int = Field(default=300, gt=10)
+    processing_memory_limit_mb: int = Field(default=512, ge=256)
+    openai_timeout_seconds: int = Field(default=60, gt=0)
+    max_model_output_tokens: int = Field(default=8000, gt=0)
     max_pdf_pages: int = 200
     max_ocr_pages: int = 50
     max_extracted_text_characters: int = 500_000
@@ -60,6 +75,11 @@ class Settings(BaseSettings):
         if self.auth_mode == "supabase" and not self.supabase_url:
             raise ValueError("SUPABASE_URL is required when AUTH_MODE=supabase.")
         if self.app_env == "production":
+            if self.processing_mode != "celery" or self.celery_task_always_eager:
+                raise ValueError(
+                    "Production requires PROCESSING_MODE=celery and "
+                    "CELERY_TASK_ALWAYS_EAGER=false for worker resource isolation."
+                )
             if self.auth_mode == "dev":
                 raise ValueError("AUTH_MODE=dev is not allowed when APP_ENV=production.")
             if self.storage_mode != "supabase":

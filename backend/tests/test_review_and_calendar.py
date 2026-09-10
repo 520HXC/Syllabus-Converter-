@@ -943,6 +943,45 @@ def test_patch_recurring_series_preserves_ignored_members_until_restore(app_clie
     assert statuses == ["needs_review", "needs_review"]
 
 
+@pytest.mark.parametrize("next_status", ["confirmed", "pending"])
+def test_recurring_series_preserves_removal_committed_after_loading(
+    app_client, monkeypatch, next_status,
+):
+    from sqlalchemy import update
+    from sqlalchemy.orm import Session
+
+    client, app = app_client
+    _, series_id, _ = seed_recurring_series_data(app)
+    original_scalar = Session.scalar
+    removed_ids = []
+
+    def load_then_remove(session, statement, *args, **kwargs):
+        result = original_scalar(session, statement, *args, **kwargs)
+        if isinstance(result, RecurringEventSeries) and not removed_ids:
+            removed_ids.append(result.events[0].id)
+            # The competing individual request commits after the bulk request
+            # loads its snapshot but before it changes the series members.
+            with app.state.session_factory() as concurrent:
+                concurrent.execute(update(ExtractedEvent).where(
+                    ExtractedEvent.id == removed_ids[0],
+                ).values(review_status=ReviewStatus.IGNORED))
+                concurrent.commit()
+        return result
+
+    monkeypatch.setattr(Session, "scalar", load_then_remove)
+    response = client.patch(
+        f"/api/recurring-series/{series_id}", headers=auth_headers(),
+        json={"review_status": next_status},
+    )
+    assert response.status_code == 200
+    assert response.json()["review_status"] == "mixed"
+    with app.state.session_factory() as session:
+        assert session.get(ExtractedEvent, removed_ids[0]).review_status == ReviewStatus.IGNORED
+        statuses = [event.review_status.value for event in session.query(ExtractedEvent)
+                    .where(ExtractedEvent.recurring_series_id == series_id).all()]
+        assert sorted(statuses) == sorted(["ignored", next_status])
+
+
 def test_other_user_cannot_patch_recurring_series(app_client):
     client, app = app_client
     _, series_id, _ = seed_recurring_series_data(app)

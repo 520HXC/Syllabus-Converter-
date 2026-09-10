@@ -23,7 +23,9 @@ from sqlalchemy.orm import Session, selectinload
 from .auth import CurrentUser, get_current_user
 from .config import Settings, get_settings
 from .database import get_db
+from .errors import public_error_message
 from .ical import build_calendar
+from .limits import lock_admission, reserve_processing
 from .models import (
     Course,
     ExtractedEvent,
@@ -89,7 +91,10 @@ def owned_semester(db: Session, semester_id: UUID, user_id: UUID) -> Semester:
 
 
 def job_read(job: ProcessingJob, *, hide_syllabus_typo_fallback: bool = False) -> JobRead:
-    update: dict[str, object] = {"filename": job.document.filename}
+    update: dict[str, object] = {
+        "filename": job.document.filename,
+        "error_message": public_error_message(job.error_message),
+    }
     if hide_syllabus_typo_fallback:
         update.update({"fallback_used": False, "fallback_reason_codes": []})
     return JobRead.model_validate(job).model_copy(update=update)
@@ -151,12 +156,12 @@ def event_read(
     )
 
 
-def dispatch_job(job_id: UUID, settings: Settings) -> None:
+def dispatch_job(job_id: UUID, settings: Settings, *, execution_id: str | None = None) -> None:
     if settings.processing_mode == "manual":
         return
     from .worker import process_document_job
 
-    process_document_job.delay(str(job_id))
+    process_document_job.apply_async(args=[str(job_id)], task_id=execution_id)
 
 
 def mark_job_dispatch_failed(
@@ -164,9 +169,20 @@ def mark_job_dispatch_failed(
     job: ProcessingJob,
     error: Exception,
 ) -> None:
-    job.status = JobStatus.FAILED
-    job.stage_detail = "Dispatch failed"
-    job.error_message = DISPATCH_FAILURE_MESSAGE
+    db.execute(
+        update(ProcessingJob)
+        .where(
+            ProcessingJob.id == job.id,
+            ProcessingJob.status == JobStatus.QUEUED,
+            ProcessingJob.execution_id == job.execution_id,
+            ProcessingJob.updated_at == job.updated_at,
+        )
+        .values(
+            status=JobStatus.FAILED,
+            stage_detail="Dispatch failed",
+            error_message=DISPATCH_FAILURE_MESSAGE,
+        )
+    )
     db.commit()
     db.refresh(job)
 
@@ -177,7 +193,7 @@ def dispatch_or_mark_failed(
     settings: Settings,
 ) -> None:
     try:
-        dispatch_job(job.id, settings)
+        dispatch_job(job.id, settings, execution_id=job.execution_id)
     except Exception as error:
         mark_job_dispatch_failed(db, job, error)
 
@@ -380,7 +396,7 @@ def delete_semester(
     response_model=UploadResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def upload_syllabi(
+def upload_syllabi(
     semester_id: UUID,
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
@@ -396,28 +412,43 @@ async def upload_syllabi(
     if not files:
         raise HTTPException(status_code=400, detail="Choose at least one PDF file.")
 
-    pending: list[tuple[UploadFile, bytes]] = []
+    pending: list[tuple[UploadFile, int]] = []
+    total_bytes = 0
     for uploaded in files:
         filename = safe_filename(uploaded.filename)
         if uploaded.content_type != "application/pdf" or not filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=415, detail="Only PDF syllabus files are supported.")
-        content = await uploaded.read(settings.max_upload_bytes + 1)
-        if len(content) > settings.max_upload_bytes:
-            raise HTTPException(status_code=413, detail="Each PDF must be 20 MB or smaller.")
-        if not content.startswith(b"%PDF"):
+        prefix = uploaded.file.read(4)
+        if prefix != b"%PDF":
             raise HTTPException(status_code=415, detail="The selected file is not a valid PDF.")
-        pending.append((uploaded, content))
+        size = len(prefix)
+        while chunk := uploaded.file.read(64 * 1024):
+            size += len(chunk)
+            if size > settings.max_upload_bytes:
+                raise HTTPException(status_code=413, detail="Each PDF must be 20 MB or smaller.")
+            if total_bytes + size > settings.max_upload_total_bytes:
+                raise HTTPException(status_code=413, detail="The combined PDF upload is too large.")
+        total_bytes += size
+        if total_bytes > settings.max_upload_total_bytes:
+            raise HTTPException(status_code=413, detail="The combined PDF upload is too large.")
+        uploaded.file.seek(0)
+        pending.append((uploaded, size))
+
+    lock_admission(db)
+    reserve_processing(db, user.id, settings, jobs=len(pending), storage_bytes=total_bytes)
 
     storage = StorageService(settings)
     jobs: list[ProcessingJob] = []
     saved_storage_keys: list[str] = []
     try:
-        for uploaded, content in pending:
+        for uploaded, size in pending:
             filename = safe_filename(uploaded.filename)
             document_id = uuid4()
             storage_key = f"{user.id}/{semester.id}/{document_id}/{filename}"
             saved_storage_keys.append(storage_key)
+            content = uploaded.file.read(settings.max_upload_bytes + 1)
             storage.save(storage_key, content, "application/pdf")
+            del content
 
             document = SyllabusDocument(
                 id=document_id,
@@ -425,7 +456,7 @@ async def upload_syllabi(
                 semester_id=semester.id,
                 filename=filename,
                 content_type="application/pdf",
-                size_bytes=len(content),
+                size_bytes=size,
                 storage_key=storage_key,
             )
             job = ProcessingJob(
@@ -433,6 +464,7 @@ async def upload_syllabi(
                 semester_id=semester.id,
                 document=document,
                 status=JobStatus.QUEUED,
+                execution_id=str(uuid4()),
                 stage_detail="Waiting to process",
             )
             db.add(job)
@@ -528,6 +560,7 @@ def retry_job(
     user: CurrentUser = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ) -> JobRead:
+    lock_admission(db)
     job = db.scalar(
         select(ProcessingJob)
         .options(selectinload(ProcessingJob.document))
@@ -537,7 +570,17 @@ def retry_job(
         raise HTTPException(status_code=404, detail="Processing job not found.")
     if job.status != JobStatus.FAILED:
         raise HTTPException(status_code=409, detail="Only failed jobs can be retried.")
-    job.status = JobStatus.QUEUED
+    reserve_processing(db, user.id, settings, jobs=1)
+    claimed = db.execute(
+        update(ProcessingJob)
+        .where(
+            ProcessingJob.id == job.id,
+            ProcessingJob.status.in_([JobStatus.FAILED]),
+        )
+        .values(status=JobStatus.QUEUED, execution_id=str(uuid4()))
+    )
+    if claimed.rowcount != 1:
+        raise HTTPException(status_code=409, detail="This job has already been queued.")
     job.stage_detail = "Waiting to retry"
     job.error_message = None
     db.commit()
@@ -554,6 +597,7 @@ def reprocess_job(
     user: CurrentUser = Depends(get_current_user),
     settings: Settings = Depends(get_settings),
 ) -> JobRead:
+    lock_admission(db)
     job = db.scalar(
         select(ProcessingJob)
         .options(selectinload(ProcessingJob.document))
@@ -568,7 +612,17 @@ def reprocess_job(
             status_code=409,
             detail="Only completed or reviewable jobs can be reprocessed.",
         )
-    job.status = JobStatus.QUEUED
+    reserve_processing(db, user.id, settings, jobs=1)
+    claimed = db.execute(
+        update(ProcessingJob)
+        .where(
+            ProcessingJob.id == job.id,
+            ProcessingJob.status.in_([JobStatus.NEEDS_REVIEW, JobStatus.COMPLETED]),
+        )
+        .values(status=JobStatus.QUEUED, execution_id=str(uuid4()))
+    )
+    if claimed.rowcount != 1:
+        raise HTTPException(status_code=409, detail="This job has already been queued.")
     job.stage_detail = "Waiting to reprocess"
     job.error_message = None
     job.fallback_used = False
@@ -580,6 +634,7 @@ def reprocess_job(
             str(job.id),
             settings=settings,
             session_factory=request.app.state.session_factory,
+            execution_id=job.execution_id,
         )
         with request.app.state.session_factory() as session:
             refreshed = session.scalar(
@@ -714,14 +769,18 @@ def update_recurring_series(
         if event.review_status != ReviewStatus.IGNORED
     ):
         raise HTTPException(status_code=422, detail="Add dates before confirming this series.")
-    for event in series.events:
-        if (
-            payload.review_status in {ReviewStatus.CONFIRMED, ReviewStatus.PENDING}
-            and event.review_status == ReviewStatus.IGNORED
-        ):
-            continue
-        event.review_status = payload.review_status
+    member_update = update(ExtractedEvent).where(
+        ExtractedEvent.recurring_series_id == series_id,
+        ExtractedEvent.user_id == user.id,
+    )
+    if payload.review_status in {ReviewStatus.CONFIRMED, ReviewStatus.PENDING}:
+        # Evaluate this guard in the write itself. An individual removal may
+        # have committed after the series and its members were loaded above.
+        member_update = member_update.where(ExtractedEvent.review_status != ReviewStatus.IGNORED)
+    db.execute(member_update.values(review_status=payload.review_status)
+               .execution_options(synchronize_session=False))
     db.commit()
+    db.expire(series, ["events"])
     db.refresh(series)
     return series
 

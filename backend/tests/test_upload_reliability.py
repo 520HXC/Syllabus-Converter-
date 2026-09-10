@@ -369,7 +369,7 @@ def test_upload_marks_jobs_failed_when_dispatch_fails_after_commit(
     semester_id = create_semester(client)
     app.state.settings.processing_mode = "worker"
 
-    def fail_dispatch(job_id, settings):
+    def fail_dispatch(job_id, settings, **kwargs):
         raise RuntimeError("queue unavailable")
 
     monkeypatch.setattr("app.api.dispatch_job", fail_dispatch)
@@ -415,7 +415,7 @@ def test_upload_dispatch_failure_does_not_block_later_jobs_and_retry_reuses_same
     app.state.settings.processing_mode = "worker"
     dispatch_calls: list[str] = []
 
-    def fail_first_dispatch(job_id, settings):
+    def fail_first_dispatch(job_id, settings, **kwargs):
         dispatch_calls.append(str(job_id))
         if len(dispatch_calls) == 1:
             raise RuntimeError("queue unavailable")
@@ -452,7 +452,7 @@ def test_upload_dispatch_failure_does_not_block_later_jobs_and_retry_reuses_same
     first_job_id = jobs["first.pdf"]["id"]
     first_document_id = jobs["first.pdf"]["document_id"]
 
-    monkeypatch.setattr("app.api.dispatch_job", lambda job_id, settings: None)
+    monkeypatch.setattr("app.api.dispatch_job", lambda job_id, settings, **kwargs: None)
 
     retry = client.post(f"/api/jobs/{first_job_id}/retry", headers=auth_headers())
 

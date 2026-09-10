@@ -301,8 +301,26 @@ Create one API service and one Celery worker from `backend/Dockerfile`, then att
 The API uses the included `railway.json`. The worker command is
 
 ```text
-celery -A app.worker.celery_app worker --loglevel=INFO
+MALLOC_ARENA_MAX=2 celery -A app.worker.celery_app worker --pool=prefork --concurrency=2 --loglevel=INFO
 ```
+
+### Processing limits and existing database upgrade
+
+Before starting this version against an existing database, stop the old API and workers and run `uv run alembic upgrade head` from `backend`. This adds backend-only quota counters and job execution identifiers. New local SQLite databases are created automatically. For older local SQLite databases originally created without Alembic, back up the database and reconcile its migration baseline before upgrading; do not blindly stamp or recreate a database containing saved semesters.
+
+On PostgreSQL, the migration also makes semesters, PDF metadata, processing jobs and quota counters accessible only through the backend. It revokes direct access from `PUBLIC`, `anon` and `authenticated` while retaining the table owner's and `service_role` access. This prevents direct database requests from changing quota inputs or bypassing file cleanup. The frontend already uses the backend API for these records. Downgrading the schema deliberately keeps these access restrictions in place.
+
+Upload, retry and reprocess share persistent UTC daily limits. Defaults are 20 jobs per user and 200 globally per day, 10 active jobs per user and 50 globally, 200 MiB stored PDFs per user and 5 GiB globally. Deleting a semester frees storage but does not reset daily usage. Failed dispatches consume an admitted attempt. Failed upload transactions roll back their reservations. Limits return HTTP 429 and can be configured with the variables in `backend/.env.example`.
+
+Each batch accepts at most 40 MiB of PDFs and 1 MiB of multipart overhead. Raw request bytes are bounded before multipart parsing, including chunked requests. The upload body has a 60-second deadline and each API process admits at most four concurrent upload requests. Files are validated in chunks and only one PDF is loaded for storage at a time.
+
+Production must use Linux Celery prefork with `APP_ENV=production`, `PROCESSING_MODE=celery` and `CELERY_TASK_ALWAYS_EAGER=false`. Other production processing modes are rejected. Each fresh worker child has a 512 MiB address-space ceiling, a 300-second hard deadline. OCR rendering and recognition each have a 30-second timeout, rendered images have a 4000-pixel longest-edge limit, and oversized physical PDF pages are rejected. Worker children use separate process groups so completion, failure and hard termination also clean up OCR descendants. Soft task timeouts are disabled to prevent Python exception handlers from leaving subprocesses behind. Local development and tests do not apply Linux process isolation.
+
+Set `MALLOC_ARENA_MAX=2` in the worker process environment before Python starts, as the Docker image and worker command above do. Production startup checks this value. Putting it only in an application `.env` file is insufficient because the C allocator initializes before Python loads that file. This keeps allocator arenas inherited by replacement workers from consuming the address-space budget needed for normal OCR image buffers.
+
+OpenAI requests have a 60-second timeout, no automatic SDK retries, and an 8000-token output cap. Existing primary/fallback routing is preserved. Daily job limits bound application usage, not a fixed dollar charge; actual spend depends on configured models and provider pricing. Set provider project spending controls as an additional safeguard.
+
+Only the current execution may update job stages and replace extracted results. Duplicate or outdated task deliveries are skipped. Internal processing exceptions are replaced with safe user-facing messages, including older saved exception strings. Server diagnostics retain exception type and stack locations without raw provider bodies or document text.
 
 ### Vercel
 
