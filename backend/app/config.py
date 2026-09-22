@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     celery_task_always_eager: bool = False
 
     openai_api_key: str | None = None
-    openai_model: str = "gpt-5.6-luna"
+    openai_model: str = "gpt-6-luna"
     openai_fallback_model: str = "gpt-5.6-terra"
 
     max_upload_files: int = 10

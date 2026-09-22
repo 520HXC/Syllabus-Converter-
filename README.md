@@ -38,7 +38,7 @@ flowchart LR
 
 ## AI extraction
 
-New documents use `gpt-5.6-luna` as the primary extraction model. Every result is checked by backend rules before it reaches Review.
+New documents use `gpt-6-luna` as the primary extraction model. Every result is checked by backend rules before it reaches Review.
 
 The backend makes at most one `gpt-5.6-terra` fallback call for a document when it encounters any of these conditions
 
@@ -154,7 +154,7 @@ Keep the local demo configuration and change these backend values
 ```dotenv
 EXTRACTION_MODE=openai
 OPENAI_API_KEY=your-key
-OPENAI_MODEL=gpt-5.6-luna
+OPENAI_MODEL=gpt-6-luna
 OPENAI_FALLBACK_MODEL=gpt-5.6-terra
 MAX_PDF_PAGES=200
 MAX_OCR_PAGES=50
@@ -288,7 +288,7 @@ STORAGE_MODE=supabase
 REDIS_URL=redis://...
 CELERY_TASK_ALWAYS_EAGER=false
 OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-5.6-luna
+OPENAI_MODEL=gpt-6-luna
 OPENAI_FALLBACK_MODEL=gpt-5.6-terra
 ```
 

@@ -802,7 +802,7 @@ def test_openai_extraction_defaults_to_luna_and_excludes_routine_classes(monkeyp
         settings,
     )
 
-    assert captured["model"] == "gpt-5.6-luna"
+    assert captured["model"] == "gpt-6-luna"
     assert "Do not include routine class meetings" in captured["instructions"]
     assert result.events[0].event_date is None
 
