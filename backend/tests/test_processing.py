@@ -759,7 +759,7 @@ def test_known_recurring_series_reference_is_preserved():
     assert processing.resolve_recurring_series_id(candidate, {series_id}) == series_id
 
 
-def test_openai_extraction_defaults_to_luna_and_excludes_routine_classes(monkeypatch):
+def test_openai_extraction_defaults_to_sol_and_excludes_routine_classes(monkeypatch):
     captured: dict = {}
     output = SyllabusExtraction(
         course_code="CS-UY 1114",
@@ -802,12 +802,13 @@ def test_openai_extraction_defaults_to_luna_and_excludes_routine_classes(monkeyp
         settings,
     )
 
-    assert captured["model"] == "gpt-6-luna"
+    assert captured["model"] == "gpt-6.1-sol"
+    assert captured["reasoning"] == {"effort": "medium"}
     assert "Do not include routine class meetings" in captured["instructions"]
     assert result.events[0].event_date is None
 
 
-def test_process_job_repairs_only_retryable_luna_warnings_with_single_terra_call(
+def test_process_job_keeps_flagged_primary_items_for_review_without_retry(
     app_client, monkeypatch
 ):
     _, app = app_client
@@ -852,7 +853,7 @@ def test_process_job_repairs_only_retryable_luna_warnings_with_single_terra_call
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Introduction to Computer Science",
         instructor=None,
@@ -885,33 +886,13 @@ def test_process_job_repairs_only_retryable_luna_warnings_with_single_terra_call
             ),
         ],
     )
-    terra_output = SyllabusExtraction(
-        course_code="CS 101",
-        course_name="Introduction to Computer Science",
-        instructor=None,
-        events=[
-            CandidateEvent(
-                title="Final exam",
-                event_type="exam",
-                event_date=date(2026, 12, 16),
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                source_quote="Final exam December 16, 2026 as scheduled by Registrar",
-                source_page=1,
-                confidence="high",
-                year_was_explicit=True,
-                uncertainty_reason=None,
-            )
-        ],
-    )
 
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            if kwargs["model"] == "gpt-5.6-luna":
-                return SimpleNamespace(output_parsed=luna_output)
-            return SimpleNamespace(output_parsed=terra_output)
+            if kwargs["model"] == "gpt-6.1-sol":
+                return SimpleNamespace(output_parsed=primary_output)
+            raise AssertionError("Only the primary model may be requested.")
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -923,8 +904,7 @@ def test_process_job_repairs_only_retryable_luna_warnings_with_single_terra_call
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -933,22 +913,24 @@ def test_process_job_repairs_only_retryable_luna_warnings_with_single_terra_call
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
-        assert persisted.primary_model == "gpt-5.6-luna"
-        assert persisted.fallback_model == "gpt-5.6-terra"
-        assert persisted.fallback_used is True
-        assert persisted.fallback_reason_codes == ["LOW_CONFIDENCE", "SOURCE_MISMATCH"]
+        assert persisted.primary_model == "gpt-6.1-sol"
+        assert persisted.fallback_model is None
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
         events = sorted(persisted.document.semester.events, key=lambda item: item.title)
         assert [event.title for event in events] == ["Final exam", "Midterm exam"]
         assert {event.title: event.extraction_model for event in events} == {
-            "Final exam": "gpt-5.6-terra",
-            "Midterm exam": "gpt-5.6-luna",
+            "Final exam": "gpt-6.1-sol",
+            "Midterm exam": "gpt-6.1-sol",
         }
-        assert next(event for event in events if event.title == "Final exam").warning_codes == []
+        assert next(event for event in events if event.title == "Final exam").warning_codes == [
+            "SOURCE_MISMATCH", "LOW_CONFIDENCE",
+        ]
 
-    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_typo(
+def test_process_job_keeps_numeric_date_for_pure_source_weekday_typo(
     app_client, monkeypatch
 ):
     _, app = app_client
@@ -993,7 +975,7 @@ def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_bytes(make_pdf(page_text))
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS-UY 1114",
         course_name="Introduction to Programming and Problem Solving",
         instructor=None,
@@ -1009,27 +991,11 @@ def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_
             )
         ],
     )
-    terra_output = SyllabusExtraction(
-        course_code="CS-UY 1114",
-        course_name="Introduction to Programming and Problem Solving",
-        instructor=None,
-        events=[
-            CandidateEvent(
-                title="No lecture - Friday schedule",
-                event_type="class",
-                event_date=date(2025, 11, 26),
-                source_quote="27-Nov Wednesday No Lecture, Friday Schedule",
-                source_page=1,
-                confidence="high",
-                year_was_explicit=False,
-            )
-        ],
-    )
 
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            output = luna_output if kwargs["model"] == "gpt-5.6-luna" else terra_output
+            output = primary_output
             return SimpleNamespace(output_parsed=output)
 
     class FakeOpenAI:
@@ -1042,8 +1008,7 @@ def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1058,7 +1023,7 @@ def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_
         assert len(events) == 1
         event = events[0]
         assert event.event_date == date(2025, 11, 27)
-        assert event.extraction_model == "gpt-5.6-luna"
+        assert event.extraction_model == "gpt-6.1-sol"
         assert event.warning_codes == ["DATE_CONFLICT"]
         assert (
             event.warning_reason
@@ -1067,10 +1032,10 @@ def test_process_job_keeps_numeric_date_and_skips_terra_for_pure_source_weekday_
         )
         assert event.derivation_summary is None
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_cross_event_date_conflict_stays_retryable_when_source_has_weekday_typo():
+def test_cross_event_date_conflict_stays_visible_when_source_has_weekday_typo():
     candidate = CandidateEvent(
         title="No lecture - Friday schedule",
         event_type="class",
@@ -1080,11 +1045,6 @@ def test_cross_event_date_conflict_stays_retryable_when_source_has_weekday_typo(
         confidence="high",
         year_was_explicit=False,
     )
-    extraction = SyllabusExtraction(
-        course_code="CS-UY 1114",
-        course_name="Introduction to Programming and Problem Solving",
-        events=[candidate],
-    )
     pages = [
         {
             "page": 1,
@@ -1093,19 +1053,19 @@ def test_cross_event_date_conflict_stays_retryable_when_source_has_weekday_typo(
         }
     ]
 
-    retryable_codes, flagged_events, _, _ = processing._preview_retryable_codes(
-        extraction,
-        pages,
-        semester_start=date(2025, 8, 25),
-        semester_end=date(2025, 12, 20),
-        known_dates_by_title={candidate.title.casefold(): {date(2025, 11, 26)}},
+    assert processing._is_source_weekday_typo(
+        candidate, date(2025, 8, 25), date(2025, 12, 20), pages,
     )
+    assert detect_date_conflict(
+        candidate.title, candidate.event_date,
+        {candidate.title.casefold(): {date(2025, 11, 26)}},
+    )
+    assert "DATE_CONFLICT" in validate_candidate(
+        candidate, pages, date(2025, 8, 25), date(2025, 12, 20),
+    )[0]
 
-    assert retryable_codes == ["DATE_CONFLICT"]
-    assert flagged_events == {0}
 
-
-def test_process_job_skips_terra_when_warnings_are_not_retryable(app_client, monkeypatch):
+def test_process_job_keeps_non_retryable_warnings_for_review(app_client, monkeypatch):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
     calls: list[str] = []
@@ -1178,8 +1138,7 @@ def test_process_job_skips_terra_when_warnings_are_not_retryable(app_client, mon
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1188,17 +1147,17 @@ def test_process_job_skips_terra_when_warnings_are_not_retryable(app_client, mon
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
-        assert persisted.primary_model == "gpt-5.6-luna"
+        assert persisted.primary_model == "gpt-6.1-sol"
         assert persisted.fallback_used is False
         assert persisted.fallback_reason_codes == []
         event = persisted.document.semester.events[0]
-        assert event.extraction_model == "gpt-5.6-luna"
+        assert event.extraction_model == "gpt-6.1-sol"
         assert event.warning_codes == ["DATE_MISSING", "YEAR_NOT_EXPLICIT", "MODEL_UNCERTAINTY"]
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_date_missing_alone_does_not_trigger_terra_retry(app_client, monkeypatch):
+def test_date_missing_is_retained_for_review_without_retry(app_client, monkeypatch):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
     calls: list[str] = []
@@ -1271,8 +1230,7 @@ def test_date_missing_alone_does_not_trigger_terra_retry(app_client, monkeypatch
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1286,10 +1244,10 @@ def test_date_missing_alone_does_not_trigger_terra_retry(app_client, monkeypatch
         event = persisted.document.semester.events[0]
         assert event.warning_codes == ["DATE_MISSING"]
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_process_job_marks_terra_retry_failed_and_keeps_luna_events(app_client, monkeypatch):
+def test_process_job_preserves_flagged_items_without_a_repair_attempt(app_client, monkeypatch):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
 
@@ -1328,7 +1286,7 @@ def test_process_job_marks_terra_retry_failed_and_keeps_luna_events(app_client, 
         make_pdf("CS 101 Midterm exam October 14, 2026. Final exam December 16, 2026. " * 4)
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Introduction to Computer Science",
         instructor=None,
@@ -1356,7 +1314,7 @@ def test_process_job_marks_terra_retry_failed_and_keeps_luna_events(app_client, 
         def parse(self, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                return SimpleNamespace(output_parsed=luna_output)
+                return SimpleNamespace(output_parsed=primary_output)
             return SimpleNamespace(output_parsed=None)
 
     fake_responses = FakeResponses()
@@ -1370,8 +1328,7 @@ def test_process_job_marks_terra_retry_failed_and_keeps_luna_events(app_client, 
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1380,18 +1337,14 @@ def test_process_job_marks_terra_retry_failed_and_keeps_luna_events(app_client, 
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
-        assert persisted.fallback_used is True
-        assert persisted.fallback_reason_codes == [
-            "LOW_CONFIDENCE",
-            "SOURCE_MISMATCH",
-            "TERRA_RETRY_FAILED",
-        ]
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
         event = persisted.document.semester.events[0]
-        assert event.extraction_model == "gpt-5.6-luna"
-        assert event.warning_codes == ["SOURCE_MISMATCH", "LOW_CONFIDENCE", "TERRA_RETRY_FAILED"]
+        assert event.extraction_model == "gpt-6.1-sol"
+        assert event.warning_codes == ["SOURCE_MISMATCH", "LOW_CONFIDENCE"]
 
 
-def test_process_job_does_not_fallback_on_luna_operational_failure(app_client, monkeypatch):
+def test_process_job_fails_safely_on_primary_operational_failure(app_client, monkeypatch):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
     calls: list[str] = []
@@ -1432,7 +1385,7 @@ def test_process_job_does_not_fallback_on_luna_operational_failure(app_client, m
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            raise TimeoutError("Luna timed out")
+            raise TimeoutError("Primary model timed out")
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -1443,8 +1396,7 @@ def test_process_job_does_not_fallback_on_luna_operational_failure(app_client, m
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1456,10 +1408,10 @@ def test_process_job_does_not_fallback_on_luna_operational_failure(app_client, m
         assert persisted.error_message == PROCESSING_FAILED_MESSAGE
         assert persisted.fallback_used is False
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_process_job_fails_on_terra_repair_operational_failure(app_client, monkeypatch):
+def test_process_job_does_not_call_a_second_model_for_source_mismatch(app_client, monkeypatch):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
     calls: list[str] = []
@@ -1497,7 +1449,7 @@ def test_process_job_fails_on_terra_repair_operational_failure(app_client, monke
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_bytes(make_pdf("CS 101 Final exam December 16, 2026. " * 8))
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Introduction to Computer Science",
         instructor=None,
@@ -1521,9 +1473,9 @@ def test_process_job_fails_on_terra_repair_operational_failure(app_client, monke
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            if kwargs["model"] == "gpt-5.6-luna":
-                return SimpleNamespace(output_parsed=luna_output)
-            raise TimeoutError("Terra timed out")
+            if kwargs["model"] == "gpt-6.1-sol":
+                return SimpleNamespace(output_parsed=primary_output)
+            raise AssertionError("No secondary request is allowed")
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -1534,8 +1486,7 @@ def test_process_job_fails_on_terra_repair_operational_failure(app_client, monke
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1543,13 +1494,16 @@ def test_process_job_fails_on_terra_repair_operational_failure(app_client, monke
 
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
-        assert persisted.status == JobStatus.FAILED
-        assert persisted.error_message == PROCESSING_FAILED_MESSAGE
+        assert persisted.status == JobStatus.NEEDS_REVIEW
+        assert persisted.error_message is None
+        assert persisted.document.semester.events[0].warning_codes == [
+            "SOURCE_MISMATCH", "LOW_CONFIDENCE",
+        ]
 
-    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_process_job_fails_when_both_models_cannot_parse_structured_output(app_client, monkeypatch):
+def test_process_job_fails_when_primary_cannot_parse_structured_output(app_client, monkeypatch):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
 
@@ -1599,8 +1553,7 @@ def test_process_job_fails_when_both_models_cannot_parse_structured_output(app_c
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1764,7 +1717,7 @@ def test_process_job_normalizes_ambiguous_recurring_candidate_without_duplicatio
         make_pdf("Quick Checks at 8AM the morning of lecture with nearly every topic. " * 4)
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
@@ -1809,7 +1762,7 @@ def test_process_job_normalizes_ambiguous_recurring_candidate_without_duplicatio
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -1820,8 +1773,7 @@ def test_process_job_normalizes_ambiguous_recurring_candidate_without_duplicatio
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1844,16 +1796,15 @@ def test_process_job_normalizes_ambiguous_recurring_candidate_without_duplicatio
         )
         assert event.confidence.value == "medium"
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_process_job_uses_single_terra_call_for_missing_deterministic_recurring_rule(
+def test_process_job_preserves_an_omitted_exact_rule_as_undated_review_item(
     app_client, monkeypatch
 ):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
     calls: list[str] = []
-    terra_instructions: list[str] = []
 
     with app.state.session_factory() as session:
         semester = Semester(
@@ -1890,48 +1841,20 @@ def test_process_job_uses_single_terra_call_for_missing_deterministic_recurring_
         make_pdf("Homework due every Friday from Sep 4, 2026 through Sep 18, 2026. " * 4)
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Introduction to Computer Science",
         instructor=None,
         events=[],
         recurring_rules=[],
     )
-    terra_output = SyllabusExtraction(
-        course_code="CS 101",
-        course_name="Introduction to Computer Science",
-        instructor=None,
-        events=[],
-        recurring_rules=[
-            RecurringRule(
-                title="Homework",
-                event_type="assignment",
-                rule_kind="weekly_fixed",
-                weekday="friday",
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                boundary_start=date(2026, 9, 4),
-                boundary_end=date(2026, 9, 18),
-                exclusion_dates=[],
-                source_quote="Homework due every Friday from Sep 4, 2026 through Sep 18, 2026",
-                source_page=1,
-                confidence="high",
-                anchor_title=None,
-                offset_days=None,
-                uncertainty_reason=None,
-                expansion_mode="exact",
-            )
-        ],
-    )
 
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            if kwargs["model"] == "gpt-5.6-luna":
-                return SimpleNamespace(output_parsed=luna_output)
-            terra_instructions.append(kwargs["instructions"])
-            return SimpleNamespace(output_parsed=terra_output)
+            if kwargs["model"] == "gpt-6.1-sol":
+                return SimpleNamespace(output_parsed=primary_output)
+            raise AssertionError("Only the primary model may be requested.")
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -1942,8 +1865,7 @@ def test_process_job_uses_single_terra_call_for_missing_deterministic_recurring_
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -1952,20 +1874,19 @@ def test_process_job_uses_single_terra_call_for_missing_deterministic_recurring_
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
-        assert persisted.fallback_used is True
-        assert persisted.fallback_reason_codes == ["RECURRING_RULE_MISSING"]
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
         events = sorted(persisted.document.semester.events, key=lambda item: item.event_date)
-        assert [event.event_date for event in events] == [
-            date(2026, 9, 4),
-            date(2026, 9, 11),
-            date(2026, 9, 18),
-        ]
+        assert len(events) == 1
+        assert events[0].title == "Homework"
+        assert events[0].event_date is None
+        assert "RECURRING_RULE_MISSING" in events[0].warning_codes
+        assert events[0].review_status == ReviewStatus.NEEDS_REVIEW
 
-    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert "recover missing schedule anchors or recurring rules" in terra_instructions[0]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_process_job_does_not_trigger_terra_for_ambiguous_recurring_standalone_candidate(
+def test_process_job_keeps_ambiguous_recurring_standalone_candidate(
     app_client, monkeypatch
 ):
     _, app = app_client
@@ -2007,7 +1928,7 @@ def test_process_job_does_not_trigger_terra_for_ambiguous_recurring_standalone_c
         make_pdf("Quick Checks at 8AM the morning of lecture with nearly every topic. " * 4)
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
@@ -2032,7 +1953,7 @@ def test_process_job_does_not_trigger_terra_for_ambiguous_recurring_standalone_c
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -2043,8 +1964,7 @@ def test_process_job_does_not_trigger_terra_for_ambiguous_recurring_standalone_c
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -2057,10 +1977,10 @@ def test_process_job_does_not_trigger_terra_for_ambiguous_recurring_standalone_c
         assert persisted.fallback_reason_codes == []
         assert persisted.document.semester.events[0].title == "Quick Checks"
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
-def test_process_job_merges_multiple_fallback_reasons_into_one_terra_call(
+def test_process_job_retains_multiple_validation_findings_without_retry(
     app_client, monkeypatch
 ):
     _, app = app_client
@@ -2105,7 +2025,7 @@ def test_process_job_merges_multiple_fallback_reasons_into_one_terra_call(
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Introduction to Computer Science",
         instructor=None,
@@ -2126,54 +2046,13 @@ def test_process_job_merges_multiple_fallback_reasons_into_one_terra_call(
         ],
         recurring_rules=[],
     )
-    terra_output = SyllabusExtraction(
-        course_code="CS 101",
-        course_name="Introduction to Computer Science",
-        instructor=None,
-        events=[
-            CandidateEvent(
-                title="Final exam",
-                event_type="exam",
-                event_date=date(2026, 12, 16),
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                source_quote="Final exam December 16, 2026 as scheduled by Registrar",
-                source_page=1,
-                confidence="high",
-                year_was_explicit=True,
-                uncertainty_reason=None,
-            )
-        ],
-        recurring_rules=[
-            RecurringRule(
-                title="Homework",
-                event_type="assignment",
-                rule_kind="weekly_fixed",
-                weekday="friday",
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                boundary_start=date(2026, 9, 4),
-                boundary_end=date(2026, 9, 18),
-                exclusion_dates=[],
-                source_quote="Homework due every Friday from Sep 4, 2026 through Sep 18, 2026",
-                source_page=1,
-                confidence="high",
-                anchor_title=None,
-                offset_days=None,
-                uncertainty_reason=None,
-                expansion_mode="exact",
-            )
-        ],
-    )
 
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            if kwargs["model"] == "gpt-5.6-luna":
-                return SimpleNamespace(output_parsed=luna_output)
-            return SimpleNamespace(output_parsed=terra_output)
+            if kwargs["model"] == "gpt-6.1-sol":
+                return SimpleNamespace(output_parsed=primary_output)
+            raise AssertionError("Only the primary model may be requested.")
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -2184,8 +2063,7 @@ def test_process_job_merges_multiple_fallback_reasons_into_one_terra_call(
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -2194,14 +2072,10 @@ def test_process_job_merges_multiple_fallback_reasons_into_one_terra_call(
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
-        assert persisted.fallback_used is True
-        assert persisted.fallback_reason_codes == [
-            "LOW_CONFIDENCE",
-            "SOURCE_MISMATCH",
-            "RECURRING_RULE_MISSING",
-        ]
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
 
-    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert calls == ["gpt-6.1-sol"]
 
 
 def test_openai_extraction_instructions_request_schedule_occurrences_and_review_only_rules(
@@ -2240,67 +2114,6 @@ def test_openai_extraction_instructions_request_schedule_occurrences_and_review_
     assert "expansion_mode review_only" in captured["instructions"]
 
 
-def test_merge_extractions_preserves_unrelated_luna_anchors_when_terra_returns_partial_repair():
-    primary = SyllabusExtraction(
-        course_code="CS 101",
-        course_name="Foundations of Computing",
-        instructor=None,
-        events=[],
-        schedule_anchors=[
-            ScheduleAnchor(
-                title="Lecture",
-                anchor_type="lecture",
-                weekday="monday",
-                start_time=time(9, 0),
-                end_time=time(10, 0),
-                boundary_start=date(2025, 8, 25),
-                boundary_end=date(2025, 12, 19),
-                exclusion_dates=[],
-                source_quote="Lecture every Monday",
-                source_page=1,
-            ),
-            ScheduleAnchor(
-                title="Lab",
-                anchor_type="lab",
-                weekday="wednesday",
-                start_time=time(13, 0),
-                end_time=time(15, 0),
-                boundary_start=date(2025, 8, 27),
-                boundary_end=date(2025, 12, 17),
-                exclusion_dates=[],
-                source_quote="Lab every Wednesday",
-                source_page=2,
-            ),
-        ],
-        recurring_rules=[],
-    )
-    repair = processing.SyllabusRepair(
-        schedule_anchors=[
-            ScheduleAnchor(
-                title="Lecture",
-                anchor_type="lecture",
-                weekday="tuesday",
-                start_time=time(9, 30),
-                end_time=time(10, 30),
-                boundary_start=date(2025, 8, 26),
-                boundary_end=date(2025, 12, 16),
-                exclusion_dates=[],
-                source_quote="Lecture every Tuesday",
-                source_page=3,
-            )
-        ]
-    )
-
-    merged = processing._merge_extractions(primary, repair, set(), set())
-
-    assert len(merged.schedule_anchors) == 2
-    assert {anchor.title for anchor in merged.schedule_anchors} == {"Lecture", "Lab"}
-    lecture = next(anchor for anchor in merged.schedule_anchors if anchor.title == "Lecture")
-    lab = next(anchor for anchor in merged.schedule_anchors if anchor.title == "Lab")
-    assert lecture.weekday == "tuesday"
-    assert lecture.source_page == 3
-    assert lab.weekday == "wednesday"
-    assert lab.source_page == 2
 
 
 def test_detect_missing_recurring_rule_normalizes_titles_for_is_due_and_are_due_each():
@@ -3045,7 +2858,7 @@ def test_process_job_collapses_lab_makeup_aliases_without_merging_unrelated_lab_
         assert events[1].source_quote == unrelated_source
 
 
-def test_process_job_collapses_same_policy_terra_lab_alias_with_hallucinated_date(
+def test_process_job_collapses_same_policy_alias_with_hallucinated_date(
     app_client, monkeypatch
 ):
     _, app = app_client
@@ -3106,7 +2919,7 @@ def test_process_job_collapses_same_policy_terra_lab_alias_with_hallucinated_dat
                 confidence="low",
                 year_was_explicit=True,
                 uncertainty_reason="The source wording is tentative.",
-                extraction_model="gpt-5.6-luna",
+                extraction_model="gpt-6.1-sol",
             ),
             CandidateEvent(
                 title="Lab assignment make-up deadline",
@@ -3118,7 +2931,7 @@ def test_process_job_collapses_same_policy_terra_lab_alias_with_hallucinated_dat
                 source_page=1,
                 confidence="medium",
                 year_was_explicit=True,
-                extraction_model="gpt-5.6-luna",
+                extraction_model="gpt-6.1-sol",
             ),
             CandidateEvent(
                 title="Lab make-up submission deadline",
@@ -3136,13 +2949,8 @@ def test_process_job_collapses_same_policy_terra_lab_alias_with_hallucinated_dat
     )
 
     monkeypatch.setattr(
-        "app.processing._extract_with_model_fallback",
-        lambda pages, settings, semester_start, semester_end, known_dates_by_title: (
-            extraction.model_copy(deep=True),
-            True,
-            ["LOW_CONFIDENCE"],
-            set(),
-        ),
+        "app.processing.extract_with_openai",
+        lambda pages, settings: extraction.model_copy(deep=True),
     )
     monkeypatch.setattr(
         "app.processing.extract_pdf_pages",
@@ -3164,8 +2972,7 @@ def test_process_job_collapses_same_policy_terra_lab_alias_with_hallucinated_dat
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -3184,7 +2991,7 @@ def test_process_job_collapses_same_policy_terra_lab_alias_with_hallucinated_dat
         assert event.title == "Lab assignment make-up deadline"
         assert event.event_date is None
         assert event.source_quote == policy_source
-        assert event.extraction_model == "gpt-5.6-luna"
+        assert event.extraction_model == "gpt-6.1-sol"
 
 
 def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
@@ -3233,7 +3040,7 @@ def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
@@ -3256,7 +3063,7 @@ def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
                 anchor_title="Lecture",
                 offset_days=0,
                 uncertainty_reason=None,
-                extraction_model="gpt-5.6-luna",
+                extraction_model="gpt-6.1-sol",
             ),
             RecurringRule(
                 title="Exercise Sets",
@@ -3275,7 +3082,7 @@ def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
                 anchor_title="Lecture",
                 offset_days=1,
                 uncertainty_reason=None,
-                extraction_model="gpt-5.6-luna",
+                extraction_model="gpt-6.1-sol",
             ),
         ],
     )
@@ -3283,7 +3090,7 @@ def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -3294,8 +3101,7 @@ def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -3311,7 +3117,7 @@ def test_process_job_uses_page_context_for_actual_quick_and_exercise_quotes(
         assert all("AMBIGUOUS_RECURRENCE" in event.warning_codes for event in events)
         assert all(event.confidence.value == "medium" for event in events)
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
 def test_process_job_materializes_review_only_rule_without_existing_event(
@@ -3358,7 +3164,7 @@ def test_process_job_materializes_review_only_rule_without_existing_event(
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
@@ -3381,14 +3187,14 @@ def test_process_job_materializes_review_only_rule_without_existing_event(
                 anchor_title="Lecture",
                 offset_days=0,
                 uncertainty_reason=None,
-                extraction_model="gpt-5.6-luna",
+                extraction_model="gpt-6.1-sol",
             )
         ],
     )
 
     class FakeResponses:
         def parse(self, **kwargs):
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -3399,8 +3205,7 @@ def test_process_job_materializes_review_only_rule_without_existing_event(
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -3416,7 +3221,7 @@ def test_process_job_materializes_review_only_rule_without_existing_event(
         assert event.source_quote == "Quick Checks - 8AM the morning of the lecture"
         assert event.source_page == 1
         assert event.start_time == time(8, 0)
-        assert event.extraction_model == "gpt-5.6-luna"
+        assert event.extraction_model == "gpt-6.1-sol"
         assert event.derivation_summary == (
             "Dates were not generated because the syllabus does not identify every occurrence."
         )
@@ -3467,7 +3272,7 @@ def test_process_job_only_marks_related_relative_no_date_event_as_ambiguous(
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
@@ -3510,7 +3315,7 @@ def test_process_job_only_marks_related_relative_no_date_event_as_ambiguous(
 
     class FakeResponses:
         def parse(self, **kwargs):
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -3521,8 +3326,7 @@ def test_process_job_only_marks_related_relative_no_date_event_as_ambiguous(
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -3600,7 +3404,7 @@ def test_expand_recurring_rules_keeps_unrelated_exact_weekly_rule_even_when_page
     ]
 
 
-def test_process_job_marks_unresolved_deterministic_rule_after_single_terra_repair(
+def test_process_job_materializes_unresolved_deterministic_rule_without_retry(
     app_client, monkeypatch
 ):
     _, app = app_client
@@ -3644,39 +3448,20 @@ def test_process_job_marks_unresolved_deterministic_rule_after_single_terra_repa
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
         events=[],
         recurring_rules=[],
     )
-    terra_output = processing.SyllabusRepair(
-        events=[
-            CandidateEvent(
-                title="Homework",
-                event_type="assignment",
-                event_date=None,
-                start_time=None,
-                end_time=None,
-                is_all_day=True,
-                source_quote="Homework is due every Friday from Sep 4, 2026 through Sep 18, 2026",
-                source_page=1,
-                confidence="medium",
-                year_was_explicit=True,
-                uncertainty_reason=None,
-            )
-        ],
-        recurring_rules=[],
-        schedule_anchors=[],
-    )
 
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            if kwargs["model"] == "gpt-5.6-luna":
-                return SimpleNamespace(output_parsed=luna_output)
-            return SimpleNamespace(output_parsed=terra_output)
+            if kwargs["model"] == "gpt-6.1-sol":
+                return SimpleNamespace(output_parsed=primary_output)
+            raise AssertionError("Only the primary model may be requested.")
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -3687,8 +3472,7 @@ def test_process_job_marks_unresolved_deterministic_rule_after_single_terra_repa
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -3697,17 +3481,17 @@ def test_process_job_marks_unresolved_deterministic_rule_after_single_terra_repa
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
-        assert persisted.fallback_used is True
-        assert persisted.fallback_reason_codes == ["RECURRING_RULE_MISSING", "TERRA_RETRY_FAILED"]
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
         events = persisted.document.semester.events
         assert len(events) == 1
         event = events[0]
         assert event.title == "Homework"
         assert event.event_date is None
-        assert "TERRA_RETRY_FAILED" in event.warning_codes
-        assert event.fallback_reason_codes == ["TERRA_RETRY_FAILED"]
+        assert "RECURRING_RULE_MISSING" in event.warning_codes
+        assert event.fallback_reason_codes == []
 
-    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert calls == ["gpt-6.1-sol"]
 
 
 def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_only_and_zero_series(
@@ -3762,7 +3546,7 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
@@ -3876,7 +3660,7 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -3887,8 +3671,7 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -3933,7 +3716,7 @@ def test_process_job_sanitized_fall_2025_policy_creates_four_dated_five_review_o
             "Quick Checks",
         }
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
 def test_process_job_filters_non_actionable_course_structure_lab_entry(
@@ -3980,7 +3763,7 @@ def test_process_job_filters_non_actionable_course_structure_lab_entry(
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Foundations of Computing",
         instructor=None,
@@ -4008,7 +3791,7 @@ def test_process_job_filters_non_actionable_course_structure_lab_entry(
 
     class FakeResponses:
         def parse(self, **kwargs):
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -4019,8 +3802,7 @@ def test_process_job_filters_non_actionable_course_structure_lab_entry(
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -4312,7 +4094,7 @@ def test_expand_recurring_rules_matches_generic_anchor_titles_across_sections():
     assert len(series[0].anchor_sources) == 3
 
 
-def test_preview_retryable_codes_flags_exact_relative_rule_without_matching_anchor():
+def test_missing_anchor_becomes_an_undated_review_item():
     extraction = SyllabusExtraction(
         course_code="CS 101",
         course_name="Intro to CS",
@@ -4342,26 +4124,22 @@ def test_preview_retryable_codes_flags_exact_relative_rule_without_matching_anch
         ],
     )
 
-    retryable_codes, _, flagged_rule_indexes, flagged_reasons = processing._preview_retryable_codes(
-        extraction,
-        pages=[
-            {
-                "page": 1,
-                "ocr": False,
-                "text": "Reflection due two days after lecture",
-            }
-        ],
-        semester_start=date(2025, 8, 24),
-        semester_end=date(2025, 12, 18),
-        known_dates_by_title={},
+    pages = [{"page": 1, "ocr": False, "text": "Reflection due two days after lecture"}]
+    materialized, warning_codes = processing._materialize_unresolved_recurring_review_events(
+        extraction, pages, extraction_model="gpt-6.1-sol",
     )
+    assert warning_codes == {("lecture reflection", None): "ANCHOR_NOT_FOUND"}
+    assert len(materialized.events) == 1
+    candidate = materialized.events[0]
+    assert candidate.title == "Lecture reflection"
+    assert candidate.event_date is None
+    assert candidate.source_quote == "Reflection due two days after lecture"
+    assert candidate.review_status == ReviewStatus.NEEDS_REVIEW
+    assert candidate.extraction_model == "gpt-6.1-sol"
+    assert "could not be resolved" in candidate.derivation_summary
 
-    assert retryable_codes == ["ANCHOR_NOT_FOUND"]
-    assert flagged_rule_indexes == {0}
-    assert "ANCHOR_NOT_FOUND" in flagged_reasons["rules"][0]
 
-
-def test_process_job_review_only_relative_rule_without_anchor_skips_terra(app_client, monkeypatch):
+def test_process_job_keeps_review_only_relative_rule_without_anchor(app_client, monkeypatch):
     _, app = app_client
     storage_path = Path(app.state.settings.local_storage_path)
     calls: list[str] = []
@@ -4404,7 +4182,7 @@ def test_process_job_review_only_relative_rule_without_anchor_skips_terra(app_cl
         )
     )
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Intro to CS",
         instructor=None,
@@ -4436,7 +4214,7 @@ def test_process_job_review_only_relative_rule_without_anchor_skips_terra(app_cl
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            return SimpleNamespace(output_parsed=luna_output)
+            return SimpleNamespace(output_parsed=primary_output)
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -4447,8 +4225,7 @@ def test_process_job_review_only_relative_rule_without_anchor_skips_terra(app_cl
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -4461,7 +4238,7 @@ def test_process_job_review_only_relative_rule_without_anchor_skips_terra(app_cl
         assert persisted.fallback_reason_codes == []
         assert len(persisted.document.semester.events) == 1
 
-    assert calls == ["gpt-5.6-luna"]
+    assert calls == ["gpt-6.1-sol"]
 
 
 def test_process_job_materializes_unresolved_exact_relative_rule_without_anchor(
@@ -4504,7 +4281,7 @@ def test_process_job_materializes_unresolved_exact_relative_rule_without_anchor(
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_bytes(make_pdf("Reflection due two days after lecture. " * 4))
 
-    luna_output = SyllabusExtraction(
+    primary_output = SyllabusExtraction(
         course_code="CS 101",
         course_name="Intro to CS",
         instructor=None,
@@ -4532,21 +4309,13 @@ def test_process_job_materializes_unresolved_exact_relative_rule_without_anchor(
             )
         ],
     )
-    terra_output = processing.SyllabusRepair(
-        course_code="CS 101",
-        course_name="Intro to CS",
-        instructor=None,
-        events=[],
-        schedule_anchors=[],
-        recurring_rules=[],
-    )
 
     class FakeResponses:
         def parse(self, **kwargs):
             calls.append(kwargs["model"])
-            if kwargs["model"] == "gpt-5.6-luna":
-                return SimpleNamespace(output_parsed=luna_output)
-            return SimpleNamespace(output_parsed=terra_output)
+            if kwargs["model"] == "gpt-6.1-sol":
+                return SimpleNamespace(output_parsed=primary_output)
+            raise AssertionError("Only the primary model may be requested.")
 
     class FakeOpenAI:
         def __init__(self, api_key, **kwargs):
@@ -4557,8 +4326,7 @@ def test_process_job_materializes_unresolved_exact_relative_rule_without_anchor(
         update={
             "extraction_mode": "openai",
             "openai_api_key": "test-key",
-            "openai_model": "gpt-5.6-luna",
-            "openai_fallback_model": "gpt-5.6-terra",
+            "openai_model": "gpt-6.1-sol",
         }
     )
 
@@ -4567,18 +4335,18 @@ def test_process_job_materializes_unresolved_exact_relative_rule_without_anchor(
     with app.state.session_factory() as session:
         persisted = session.get(ProcessingJob, job_id)
         assert persisted.status == JobStatus.NEEDS_REVIEW, persisted.error_message
-        assert persisted.fallback_used is True
-        assert persisted.fallback_reason_codes == ["ANCHOR_NOT_FOUND", "TERRA_RETRY_FAILED"]
+        assert persisted.fallback_used is False
+        assert persisted.fallback_reason_codes == []
         events = persisted.document.semester.events
         assert len(events) == 1
         event = events[0]
         assert event.title == "Lecture reflection"
         assert event.event_date is None
         assert event.recurring_series_id is None
-        assert "TERRA_RETRY_FAILED" in event.warning_codes
-        assert event.fallback_reason_codes == ["TERRA_RETRY_FAILED"]
+        assert "ANCHOR_NOT_FOUND" in event.warning_codes
+        assert event.fallback_reason_codes == []
 
-    assert calls == ["gpt-5.6-luna", "gpt-5.6-terra"]
+    assert calls == ["gpt-6.1-sol"]
 
 
 def test_expand_recurring_rules_honors_boundaries_exclusions_dedupes_and_caps():

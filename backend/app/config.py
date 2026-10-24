@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,8 +31,8 @@ class Settings(BaseSettings):
     celery_task_always_eager: bool = False
 
     openai_api_key: str | None = None
-    openai_model: str = "gpt-6-luna"
-    openai_fallback_model: str = "gpt-5.6-terra"
+    openai_model: str = "gpt-6.1-sol"
+    openai_reasoning_effort: Literal["low", "medium", "high"] = "medium"
 
     max_upload_files: int = 10
     max_upload_bytes: int = 20 * 1024 * 1024

@@ -38,17 +38,9 @@ flowchart LR
 
 ## AI extraction
 
-New documents use `gpt-6-luna` as the primary extraction model. Every result is checked by backend rules before it reaches Review.
+New documents use `gpt-6.1-sol` with `medium` reasoning effort. Each processing attempt makes one structured extraction request. There is no secondary model or automatic model repair call.
 
-The backend makes at most one `gpt-5.6-terra` fallback call for a document when it encounters any of these conditions
-
-- `LOW_CONFIDENCE`
-- `SOURCE_MISMATCH`
-- `SOURCE_PAGE_MISSING`
-- `DATE_CONFLICT`
-- Invalid structured output from the primary model
-
-When only part of a Luna response needs repair, Terra receives the flagged items and leaves validated items unchanged. A failed repair keeps valid Luna data and marks the unresolved items for Review. If neither model can produce a valid structure, the file is marked as failed and can be retried.
+Every result is checked by backend rules before it reaches Review. Low confidence, conflicting dates or times, and missing source evidence remain visible for human review. Missing or unresolved recurring schedules are retained as undated Review items instead of silently disappearing. Invalid structured output or a failed API request marks the job as failed so the user can retry it.
 
 The AI identifies recurring rules and their source evidence. Python expands supported weekly and lecture-relative rules into concrete dates, applies exceptions, keeps dates inside the semester, removes duplicates, and limits each series to 200 occurrences.
 
@@ -66,7 +58,7 @@ AI output never goes directly onto the published calendar. Only confirmed dated 
 | Database | PostgreSQL with SQLAlchemy 2 and Alembic |
 | Background work | Celery and Redis |
 | PDF processing | PyMuPDF, pdf2image, Tesseract OCR |
-| AI | OpenAI Structured Outputs with Luna and Terra routing |
+| AI | OpenAI Structured Outputs with GPT 6.1 Sol and medium reasoning |
 | Export | icalendar |
 | Testing | Pytest, Vitest, Testing Library, Playwright |
 | Deployment | Vercel, Railway, Supabase |
@@ -154,8 +146,8 @@ Keep the local demo configuration and change these backend values
 ```dotenv
 EXTRACTION_MODE=openai
 OPENAI_API_KEY=your-key
-OPENAI_MODEL=gpt-6-luna
-OPENAI_FALLBACK_MODEL=gpt-5.6-terra
+OPENAI_MODEL=gpt-6.1-sol
+OPENAI_REASONING_EFFORT=medium
 MAX_PDF_PAGES=200
 MAX_OCR_PAGES=50
 MAX_EXTRACTED_TEXT_CHARACTERS=500000
@@ -288,8 +280,8 @@ STORAGE_MODE=supabase
 REDIS_URL=redis://...
 CELERY_TASK_ALWAYS_EAGER=false
 OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-6-luna
-OPENAI_FALLBACK_MODEL=gpt-5.6-terra
+OPENAI_MODEL=gpt-6.1-sol
+OPENAI_REASONING_EFFORT=medium
 ```
 
 Run `uv run alembic upgrade head` against the Supabase PostgreSQL database before serving traffic.
@@ -318,7 +310,7 @@ Production must use Linux Celery prefork with `APP_ENV=production`, `PROCESSING_
 
 Set `MALLOC_ARENA_MAX=2` in the worker process environment before Python starts, as the Docker image and worker command above do. Production startup checks this value. Putting it only in an application `.env` file is insufficient because the C allocator initializes before Python loads that file. This keeps allocator arenas inherited by replacement workers from consuming the address-space budget needed for normal OCR image buffers.
 
-OpenAI requests have a 60-second timeout, no automatic SDK retries, and an 8000-token output cap. Existing primary/fallback routing is preserved. Daily job limits bound application usage, not a fixed dollar charge; actual spend depends on configured models and provider pricing. Set provider project spending controls as an additional safeguard.
+OpenAI requests have a 60-second timeout, no automatic SDK retries, and an 8000-token output cap. Each attempt uses the configured model once with `OPENAI_REASONING_EFFORT=medium` by default. No automatic model fallback is used. Daily job limits bound application usage, not a fixed dollar charge; actual spend depends on configured models and provider pricing. Set provider project spending controls as an additional safeguard.
 
 Only the current execution may update job stages and replace extracted results. Duplicate or outdated task deliveries are skipped. Internal processing exceptions are replaced with safe user-facing messages, including older saved exception strings. Server diagnostics retain exception type and stack locations without raw provider bodies or document text.
 

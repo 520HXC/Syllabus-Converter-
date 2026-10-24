@@ -7,7 +7,6 @@ from app.processing import (
     CandidateEvent,
     SyllabusExtraction,
     _normalize_explicit_source_event_dates,
-    _preview_retryable_codes,
     validate_candidate,
 )
 
@@ -41,8 +40,6 @@ def test_brooklyn_pm_errors_are_not_accepted_by_validation():
     codes, reason = validate_candidate(candidate, pages, START, END)
     assert "TIME_CONFLICT" in codes
     assert "14:00" in reason
-    extraction = SyllabusExtraction(course_name="Regression", events=[candidate])
-    assert "TIME_CONFLICT" in _preview_retryable_codes(extraction, pages, START, END, {})[0]
 
 
 def test_brooklyn_exam_pm_is_corrected_with_source_provenance():
@@ -216,10 +213,6 @@ def test_recurring_homework_pm_is_validated_before_expansion():
     rule = homework_rule()
     pages = [{"page": 1, "text": rule.source_quote}]
     assert "TIME_CONFLICT" in _validate_rule(rule, pages, [])[0]
-    extraction = SyllabusExtraction(course_name="Regression", recurring_rules=[rule])
-    codes, _, indexes, _ = _preview_retryable_codes(extraction, pages, START, END, {})
-    assert "TIME_CONFLICT" in codes
-    assert indexes == {0}
 
 
 def test_recurring_homework_pm_is_normalized_in_all_expanded_occurrences():

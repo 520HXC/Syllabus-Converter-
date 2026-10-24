@@ -6,6 +6,16 @@ from pydantic import ValidationError
 from app.config import Settings
 
 
+def test_extraction_defaults_to_sol_medium_without_a_fallback(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
+    settings = Settings(_env_file=None, auth_mode="dev")
+
+    assert settings.openai_model == "gpt-6.1-sol"
+    assert settings.openai_reasoning_effort == "medium"
+    assert "openai_fallback_model" not in Settings.model_fields
+
+
 def production_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "app_env": "production",

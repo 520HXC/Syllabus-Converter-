@@ -49,25 +49,6 @@ SYLLABUS_TYPO_WARNING = (
     "Syllabus typo. The written date and weekday do not match. "
     "The numeric date was kept."
 )
-RETRYABLE_TERRA_CODES = {
-    "LOW_CONFIDENCE",
-    "SOURCE_MISMATCH",
-    "SOURCE_PAGE_MISSING",
-    "DATE_CONFLICT",
-    "TIME_CONFLICT",
-    "RECURRING_RULE_MISSING",
-    "ANCHOR_NOT_FOUND",
-}
-RETRYABLE_TERRA_CODE_ORDER = {
-    "LOW_CONFIDENCE": 0,
-    "SOURCE_MISMATCH": 1,
-    "SOURCE_PAGE_MISSING": 2,
-    "DATE_CONFLICT": 3,
-    "RECURRING_RULE_MISSING": 4,
-    "ANCHOR_NOT_FOUND": 5,
-    "TIME_CONFLICT": 6,
-    "TERRA_RETRY_FAILED": 7,
-}
 AMBIGUOUS_RECURRENCE_PATTERN = re.compile(
     r"\b(?:nearly every|usually|periodically)\b",
     re.IGNORECASE,
@@ -244,15 +225,6 @@ class ExpandedRecurringSeries(BaseModel):
     occurrence_count: int
 
 
-class SyllabusRepair(BaseModel):
-    course_code: str | None = None
-    course_name: str | None = None
-    instructor: str | None = None
-    events: list[CandidateEvent] = Field(default_factory=list)
-    schedule_anchors: list[ScheduleAnchor] = Field(default_factory=list)
-    recurring_rules: list[RecurringRule] = Field(default_factory=list)
-
-
 class StructuredExtractionError(RuntimeError):
     pass
 
@@ -325,7 +297,6 @@ def ocr_pdf_page(content: bytes, page_number: int, settings: Settings) -> str:
     finally:
         for image in images:
             image.close()
-
 
 
 def extract_pdf_pages(
@@ -427,6 +398,7 @@ def _parse_with_openai(
             text_format=text_format,
             store=False,
             max_output_tokens=settings.max_model_output_tokens,
+            reasoning={"effort": settings.openai_reasoning_effort},
         )
     except ValidationError as error:
         raise StructuredExtractionError(
@@ -652,13 +624,6 @@ def _ordered_unique(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
-def _ordered_retryable_codes(items: list[str]) -> list[str]:
-    return sorted(
-        _ordered_unique(items),
-        key=lambda item: (RETRYABLE_TERRA_CODE_ORDER.get(item, 99), item),
-    )
-
-
 def _rule_summary(rule: RecurringRule, range_start: date, range_end: date) -> str:
     if rule.rule_kind == "weekly_fixed":
         summary = f"Every {rule.weekday} between {range_start} and {range_end}"
@@ -746,7 +711,7 @@ def _validate_rule(
     return codes, " ".join(dict.fromkeys(reasons)) or None
 
 
-def _apply_extraction_model(extraction: SyllabusExtraction | SyllabusRepair, model: str) -> None:
+def _apply_extraction_model(extraction: SyllabusExtraction, model: str) -> None:
     for candidate in extraction.events:
         candidate.extraction_model = model
     for rule in extraction.recurring_rules:
@@ -1363,7 +1328,7 @@ def _normalize_ambiguous_recurring_content(
 
 
 def _detect_missing_recurring_rule(
-    extraction: SyllabusExtraction | SyllabusRepair,
+    extraction: SyllabusExtraction,
     pages: list[dict],
 ) -> list[str]:
     return [
@@ -1373,7 +1338,7 @@ def _detect_missing_recurring_rule(
 
 
 def _find_missing_recurring_rule_candidates(
-    extraction: SyllabusExtraction | SyllabusRepair,
+    extraction: SyllabusExtraction,
     pages: list[dict],
 ) -> list[dict]:
     existing_rule_titles = {_stable_title_key(rule.title) for rule in extraction.recurring_rules}
@@ -1796,236 +1761,6 @@ def expand_recurring_rules(
     return series_payloads, derived_events
 
 
-def _preview_retryable_codes(
-    extraction: SyllabusExtraction | SyllabusRepair,
-    pages: list[dict],
-    semester_start: date,
-    semester_end: date,
-    known_dates_by_title: dict[str, set[date]],
-) -> tuple[list[str], set[int], set[int], dict[str, list[str]]]:
-    retryable_codes: list[str] = []
-    flagged_event_indexes: set[int] = set()
-    flagged_reasons: dict[str, list[str]] = {"events": [], "rules": []}
-    for index, candidate in enumerate(extraction.events):
-        warning_codes, _ = validate_candidate(candidate, pages, semester_start, semester_end)
-        source_weekday_typo = _is_source_weekday_typo(
-            candidate,
-            semester_start,
-            semester_end,
-            pages,
-        )
-        cross_event_conflict = candidate.event_date is not None and detect_date_conflict(
-            candidate.title,
-            candidate.event_date,
-            known_dates_by_title,
-        )
-        matched_codes = [
-            code
-            for code in warning_codes
-            if code in RETRYABLE_TERRA_CODES
-            and not (code == "DATE_CONFLICT" and source_weekday_typo)
-        ]
-        if cross_event_conflict:
-            matched_codes.append("DATE_CONFLICT")
-        matched_codes = _ordered_retryable_codes(matched_codes)
-        if matched_codes:
-            flagged_event_indexes.add(index)
-            retryable_codes.extend(matched_codes)
-            flagged_reasons["events"].append(
-                "event["
-                f"{index}] title={candidate.title!r} "
-                f"codes={_ordered_retryable_codes(matched_codes)}"
-            )
-    flagged_rule_indexes: set[int] = set()
-    for index, rule in enumerate(extraction.recurring_rules):
-        warning_codes, _ = _validate_rule(rule, pages, extraction.schedule_anchors)
-        matched_codes = [code for code in warning_codes if code in RETRYABLE_TERRA_CODES]
-        if matched_codes:
-            flagged_rule_indexes.add(index)
-            retryable_codes.extend(matched_codes)
-            flagged_reasons["rules"].append(
-                "rule["
-                f"{index}] title={rule.title!r} "
-                f"codes={_ordered_retryable_codes(matched_codes)}"
-            )
-    missing_titles = _detect_missing_recurring_rule(extraction, pages)
-    if missing_titles:
-        retryable_codes.append("RECURRING_RULE_MISSING")
-        flagged_reasons["rules"].append(
-            "missing recurring rules for titles="
-            f"{missing_titles}"
-        )
-    return (
-        _ordered_retryable_codes(retryable_codes),
-        flagged_event_indexes,
-        flagged_rule_indexes,
-        flagged_reasons,
-    )
-
-
-def _repair_input(
-    pages: list[dict],
-    primary_extraction: SyllabusExtraction,
-    flagged_event_indexes: set[int],
-    flagged_rule_indexes: set[int],
-    flagged_reasons: dict[str, list[str]],
-) -> str:
-    repair_context = {
-        "luna_extraction": primary_extraction.model_dump(mode="json"),
-        "flagged_event_indexes": sorted(flagged_event_indexes),
-        "flagged_rule_indexes": sorted(flagged_rule_indexes),
-        "flagged_reasons": flagged_reasons,
-    }
-    return (
-        f"[LunaExtraction]\n{repair_context}\n\n"
-        f"[FullDocument]\n{_pages_for_prompt(pages)}"
-    )
-
-
-def _parse_repair_with_openai(
-    pages: list[dict],
-    settings: Settings,
-    primary_extraction: SyllabusExtraction,
-    retryable_codes: list[str],
-    flagged_event_indexes: set[int],
-    flagged_rule_indexes: set[int],
-    flagged_reasons: dict[str, list[str]],
-) -> SyllabusRepair:
-    repair_summary = ", ".join(retryable_codes)
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is required when EXTRACTION_MODE is openai.")
-    client = OpenAI(
-        api_key=settings.openai_api_key,
-        timeout=settings.openai_timeout_seconds,
-        max_retries=0,
-    )
-    try:
-        response = client.responses.parse(
-            model=settings.openai_fallback_model,
-            instructions=(
-                "Repair only the extracted items that failed deterministic validation. "
-                "Preserve source AM/PM when returning 24-hour times. A TIME_CONFLICT "
-                "requires matching this particular assessment to its own source time "
-                "or explicitly applicable deadline rule, never another item or office hours. "
-                f"Focus on these warning codes {repair_summary}. "
-                "Keep other validated Luna items unchanged. Explicitly recover missing "
-                "schedule anchors or recurring rules when the validation notes say they are "
-                "missing. Return only repaired events, schedule_anchors, and recurring_rules "
-                "that should replace flagged items or add missing recurring data. "
-                f"Flagged event indexes {sorted(flagged_event_indexes)}. "
-                f"Flagged rule indexes {sorted(flagged_rule_indexes)}. "
-                "Validation detail "
-                f"events={flagged_reasons['events']} "
-                f"rules={flagged_reasons['rules']}."
-            ),
-            input=_repair_input(
-                pages,
-                primary_extraction,
-                flagged_event_indexes,
-                flagged_rule_indexes,
-                flagged_reasons,
-            ),
-            text_format=SyllabusRepair,
-            store=False,
-            max_output_tokens=settings.max_model_output_tokens,
-        )
-    except ValidationError as error:
-        raise StructuredExtractionError(
-            "OpenAI did not return a structured syllabus extraction."
-        ) from error
-    if response.output_parsed is None:
-        raise StructuredExtractionError("OpenAI did not return a structured syllabus extraction.")
-    return response.output_parsed
-
-
-def _merge_extractions(
-    primary: SyllabusExtraction,
-    repair: SyllabusRepair,
-    flagged_event_indexes: set[int],
-    flagged_rule_indexes: set[int],
-) -> SyllabusExtraction:
-    merged_events = [
-        event.model_copy(deep=True)
-        for index, event in enumerate(primary.events)
-        if index not in flagged_event_indexes
-    ]
-    # A repair can repeat items outside its requested scope. Preserve validated
-    # primary values and compare canonical title plus date, never date alone.
-    protected_event_keys = {
-        (_normalize_title(_canonicalize_event_identity(event).title), event.event_date)
-        for event in merged_events
-    }
-    repaired_events = [
-        event
-        for event in repair.events
-        if (_normalize_title(_canonicalize_event_identity(event).title), event.event_date)
-        not in protected_event_keys
-    ]
-    replaced_event_indexes: set[int] = set()
-    for repaired_event in repaired_events:
-        repaired_title = _normalize_title(_canonicalize_event_identity(repaired_event).title)
-        matches = [
-            index for index in flagged_event_indexes
-            if _normalize_title(_canonicalize_event_identity(primary.events[index]).title)
-            == repaired_title
-        ]
-        if len(matches) > 1:
-            matches = [
-                index for index in matches
-                if primary.events[index].event_date == repaired_event.event_date
-            ]
-        elif not matches:
-            # A repair may correct a misleading title. Only an exact, uniquely
-            # shared source excerpt can establish that renamed item's identity.
-            matches = [
-                index for index in flagged_event_indexes
-                if primary.events[index].source_page == repaired_event.source_page
-                and _normalize_evidence(primary.events[index].source_quote)
-                == _normalize_evidence(repaired_event.source_quote)
-            ]
-        if len(matches) == 1:
-            replaced_event_indexes.add(matches[0])
-    merged_events.extend(repaired_events)
-    merged_events.extend(
-        primary.events[index].model_copy(deep=True)
-        for index in sorted(flagged_event_indexes - replaced_event_indexes)
-    )
-
-    merged_rules = [
-        rule.model_copy(deep=True)
-        for index, rule in enumerate(primary.recurring_rules)
-        if index not in flagged_rule_indexes
-    ]
-    if repair.recurring_rules:
-        merged_rules.extend(repair.recurring_rules)
-    else:
-        merged_rules.extend(
-            primary.recurring_rules[index].model_copy(deep=True)
-            for index in sorted(flagged_rule_indexes)
-        )
-
-    merged_anchors = [anchor.model_copy(deep=True) for anchor in primary.schedule_anchors]
-    anchor_indexes = {
-        (_stable_title_key(anchor.title), anchor.anchor_type): index
-        for index, anchor in enumerate(merged_anchors)
-    }
-    for anchor in repair.schedule_anchors:
-        key = (_stable_title_key(anchor.title), anchor.anchor_type)
-        if key in anchor_indexes:
-            merged_anchors[anchor_indexes[key]] = anchor
-        else:
-            anchor_indexes[key] = len(merged_anchors)
-            merged_anchors.append(anchor)
-    return SyllabusExtraction(
-        course_code=repair.course_code or primary.course_code,
-        course_name=repair.course_name or primary.course_name,
-        instructor=repair.instructor or primary.instructor,
-        events=merged_events,
-        schedule_anchors=merged_anchors,
-        recurring_rules=merged_rules,
-    )
-
-
 def _find_unresolved_exact_anchor_rules(
     extraction: SyllabusExtraction,
     pages: list[dict],
@@ -2039,187 +1774,61 @@ def _find_unresolved_exact_anchor_rules(
     ]
 
 
-def _extract_with_model_fallback(
+def _materialize_unresolved_recurring_review_events(
+    extraction: SyllabusExtraction,
     pages: list[dict],
-    settings: Settings,
-    semester_start: date,
-    semester_end: date,
-    known_dates_by_title: dict[str, set[date]],
-) -> tuple[SyllabusExtraction, bool, list[str], set[tuple[str, date | None]]]:
-    try:
-        primary = extract_with_openai(pages, settings, model=settings.openai_model)
-        _apply_extraction_model(primary, settings.openai_model)
-        primary = _normalize_explicit_source_event_dates(
-            primary,
-            semester_start,
-            semester_end,
-            pages,
+    *,
+    extraction_model: str,
+) -> tuple[SyllabusExtraction, dict[tuple[str, date | None], str]]:
+    """Keep omitted rules and unmatched anchors visible without a second model call."""
+    events = [event.model_copy(deep=True) for event in extraction.events]
+    unresolved: dict[tuple[str, date | None], str] = {}
+    candidates = [
+        (
+            candidate["title"], "assignment", candidate["source_quote"],
+            candidate["source_page"], ConfidenceLevel.MEDIUM, None, None, True,
+            "RECURRING_RULE_MISSING",
+            "Dates were not generated because the primary extraction "
+            "omitted the recurring schedule.",
         )
-    except StructuredExtractionError:
-        fallback = extract_with_openai(pages, settings, model=settings.openai_fallback_model)
-        _apply_extraction_model(fallback, settings.openai_fallback_model)
-        fallback = _normalize_explicit_source_event_dates(
-            fallback,
-            semester_start,
-            semester_end,
-            pages,
+        for candidate in _find_missing_recurring_rule_candidates(extraction, pages)
+    ]
+    candidates.extend(
+        (
+            _display_title(rule.title), rule.event_type, rule.source_quote,
+            rule.source_page, _cap_confidence_for_ambiguous_recurrence(rule.confidence),
+            rule.start_time, rule.end_time, rule.is_all_day, "ANCHOR_NOT_FOUND",
+            "Dates were not generated because the referenced schedule anchor "
+            "could not be resolved.",
         )
-        return fallback, True, ["PRIMARY_PARSE_FAILED"], set()
-
-    (
-        retryable_codes,
-        flagged_event_indexes,
-        flagged_rule_indexes,
-        flagged_reasons,
-    ) = _preview_retryable_codes(
-        primary,
-        pages,
-        semester_start,
-        semester_end,
-        known_dates_by_title,
+        for rule in _find_unresolved_exact_anchor_rules(extraction, pages)
     )
-    if not retryable_codes:
-        return primary, False, [], set()
-
-    failed_repair_keys = {
-        (_normalize_title(primary.events[index].title), primary.events[index].event_date)
-        for index in flagged_event_indexes
-    }
-    try:
-        repair = _parse_repair_with_openai(
-            pages,
-            settings,
-            primary,
-            retryable_codes,
-            flagged_event_indexes,
-            flagged_rule_indexes,
-            flagged_reasons,
-        )
-        _apply_extraction_model(repair, settings.openai_fallback_model)
-        merged = _merge_extractions(primary, repair, flagged_event_indexes, flagged_rule_indexes)
-        merged = _normalize_explicit_source_event_dates(
-            merged,
-            semester_start,
-            semester_end,
-            pages,
-        )
-        unresolved_missing_candidates = _find_missing_recurring_rule_candidates(merged, pages)
-        unresolved_anchor_rules = _find_unresolved_exact_anchor_rules(merged, pages)
-        if not unresolved_missing_candidates and not unresolved_anchor_rules:
-            return merged, True, retryable_codes, set()
-        merged_events = [event.model_copy(deep=True) for event in merged.events]
-        failed_repair_keys: set[tuple[str, date | None]] = set()
-        for candidate in unresolved_missing_candidates:
-            event_index = next(
-                (
-                    index
-                    for index, event in enumerate(merged_events)
-                    if _stable_title_key(event.title) == candidate["stable_title"]
-                    and event.event_date is None
-                ),
-                None,
-            )
-            if event_index is None:
-                merged_events.append(
-                    CandidateEvent(
-                        title=candidate["title"],
-                        event_type="assignment",
-                        event_date=None,
-                        start_time=None,
-                        end_time=None,
-                        is_all_day=True,
-                        source_quote=candidate["source_quote"],
-                        source_page=candidate["source_page"],
-                        confidence="medium",
-                        year_was_explicit=True,
-                        uncertainty_reason=None,
-                        extraction_model=settings.openai_fallback_model,
-                        derivation_summary=(
-                            "Dates were not generated because the syllabus does not identify "
-                            "every occurrence."
-                        ),
-                        review_status=ReviewStatus.NEEDS_REVIEW,
-                    )
-                )
-                event_index = len(merged_events) - 1
-            else:
-                merged_events[event_index] = merged_events[event_index].model_copy(
-                    update={
-                        "title": candidate["title"],
-                        "event_date": None,
-                        "source_quote": candidate["source_quote"],
-                        "source_page": candidate["source_page"],
-                        "extraction_model": settings.openai_fallback_model,
-                        "derivation_summary": (
-                            "Dates were not generated because the syllabus does not identify "
-                            "every occurrence."
-                        ),
-                        "review_status": ReviewStatus.NEEDS_REVIEW,
-                    }
-                )
-            failed_repair_keys.add((_normalize_title(merged_events[event_index].title), None))
-        for rule in unresolved_anchor_rules:
-            stable_title = _stable_title_key(rule.title)
-            event_index = next(
-                (
-                    index
-                    for index, event in enumerate(merged_events)
-                    if _stable_title_key(event.title) == stable_title
-                    and event.event_date is None
-                ),
-                None,
-            )
-            update = {
-                "title": _display_title(rule.title),
-                "event_date": None,
-                "recurring_series_id": None,
-                "source_quote": rule.source_quote,
-                "source_page": rule.source_page,
-                "extraction_model": settings.openai_fallback_model,
-                "derivation_summary": (
-                    "Dates were not generated because the referenced schedule anchor "
-                    "could not be resolved."
-                ),
+    for (title, event_type, quote, page, confidence, start, end, all_day,
+         warning_code, reason) in candidates:
+        index = next((
+            index for index, event in enumerate(events)
+            if _stable_title_key(event.title) == _stable_title_key(title)
+            and event.event_date is None
+        ), None)
+        if index is None:
+            events.append(CandidateEvent(
+                title=title, event_type=event_type, event_date=None,
+                start_time=start, end_time=end, is_all_day=all_day,
+                source_quote=quote, source_page=page, confidence=confidence,
+                year_was_explicit=True, extraction_model=extraction_model,
+                derivation_summary=reason, review_status=ReviewStatus.NEEDS_REVIEW,
+            ))
+            index = len(events) - 1
+        else:
+            events[index] = events[index].model_copy(update={
+                "title": title, "event_date": None, "recurring_series_id": None,
+                "source_quote": quote, "source_page": page,
+                "extraction_model": extraction_model, "derivation_summary": reason,
                 "review_status": ReviewStatus.NEEDS_REVIEW,
-            }
-            if event_index is None:
-                merged_events.append(
-                    CandidateEvent(
-                        title=_display_title(rule.title),
-                        event_type=rule.event_type,
-                        event_date=None,
-                        start_time=rule.start_time,
-                        end_time=rule.end_time,
-                        is_all_day=rule.is_all_day,
-                        source_quote=rule.source_quote,
-                        source_page=rule.source_page,
-                        confidence=_cap_confidence_for_ambiguous_recurrence(rule.confidence),
-                        year_was_explicit=True,
-                        uncertainty_reason=(
-                            "The referenced schedule anchor could not be matched."
-                        ),
-                        extraction_model=settings.openai_fallback_model,
-                        derivation_summary=update["derivation_summary"],
-                        review_status=ReviewStatus.NEEDS_REVIEW,
-                    )
-                )
-                event_index = len(merged_events) - 1
-            else:
-                merged_events[event_index] = merged_events[event_index].model_copy(update=update)
-            failed_repair_keys.add((_normalize_title(merged_events[event_index].title), None))
-        return (
-            merged.model_copy(update={"events": merged_events}),
-            True,
-            _ordered_retryable_codes([*retryable_codes, "TERRA_RETRY_FAILED"]),
-            failed_repair_keys,
-        )
-    except StructuredExtractionError:
-        return (
-            primary,
-            True,
-            _ordered_retryable_codes([*retryable_codes, "TERRA_RETRY_FAILED"]),
-            failed_repair_keys,
-        )
+            })
+        canonical_title = _canonicalize_event_identity(events[index]).title
+        unresolved[(_normalize_title(canonical_title), None)] = warning_code
+    return extraction.model_copy(update={"events": events}), unresolved
 
 
 def _normalize_evidence(value: str) -> str:
@@ -2576,6 +2185,12 @@ def process_job(
                 )
             job.document.extracted_pages = pages
             job.document.used_ocr = used_ocr
+            job.primary_model = (
+                settings.openai_model if settings.extraction_mode == "openai" else None
+            )
+            job.fallback_model = None
+            job.fallback_used = False
+            job.fallback_reason_codes = []
             _update_job(
                 session, job, JobStatus.EXTRACTING_EVENTS, "Extracting course dates",
                 execution_id=execution_id,
@@ -2593,33 +2208,19 @@ def process_job(
                         existing_date
                     )
 
+            unresolved_review_codes: dict[tuple[str, date | None], str] = {}
             if settings.extraction_mode == "openai":
-                job.primary_model = settings.openai_model
-                job.fallback_model = settings.openai_fallback_model
-                extraction, fallback_used, fallback_reason_codes, failed_repair_keys = (
-                    _extract_with_model_fallback(
-                        pages,
-                        settings,
-                        job.document.semester.start_date,
-                        job.document.semester.end_date,
-                        known_dates_by_title,
-                    )
+                extraction = extract_with_openai(pages, settings)
+                _apply_extraction_model(extraction, settings.openai_model)
+                extraction = _normalize_explicit_source_event_dates(
+                    extraction, job.document.semester.start_date,
+                    job.document.semester.end_date, pages,
                 )
             else:
                 extraction = extract_syllabus(pages, settings)
-                fallback_used = False
-                fallback_reason_codes = []
-                failed_repair_keys: set[tuple[str, date | None]] = set()
-                job.primary_model = None
-                job.fallback_model = None
-
-            materialized_model = None
-            if settings.extraction_mode == "openai":
-                materialized_model = (
-                    settings.openai_fallback_model
-                    if fallback_reason_codes == ["PRIMARY_PARSE_FAILED"]
-                    else settings.openai_model
-                )
+            materialized_model = (
+                settings.openai_model if settings.extraction_mode == "openai" else None
+            )
             extraction = _materialize_missing_ambiguous_review_events(
                 extraction,
                 pages,
@@ -2644,8 +2245,14 @@ def process_job(
                 job.document.semester.end_date,
                 pages,
             )
-            job.fallback_used = fallback_used
-            job.fallback_reason_codes = fallback_reason_codes
+            if settings.extraction_mode == "openai":
+                # These placeholders represent unresolved schedules, not single dates.
+                # Create them after date normalization so nearby dates cannot fill them.
+                extraction, unresolved_review_codes = (
+                    _materialize_unresolved_recurring_review_events(
+                        extraction, pages, extraction_model=settings.openai_model,
+                    )
+                )
             _update_job(
                 session, job, JobStatus.VALIDATING, "Checking dates and source evidence",
                 execution_id=execution_id,
@@ -2725,9 +2332,7 @@ def process_job(
                     )
                     or None,
                     extraction_model=series_payload.extraction_model,
-                    fallback_reason_codes=fallback_reason_codes
-                    if series_payload.extraction_model == settings.openai_fallback_model
-                    else [],
+                    fallback_reason_codes=[],
                 )
                 session.add(series_record)
                 series_map[series_payload.id] = series_payload
@@ -2782,26 +2387,14 @@ def process_job(
                     )
                 if duplicate_key[1] is not None:
                     seen.add(duplicate_key)
-                failed_key = (_normalize_title(candidate.title), candidate.event_date)
-                if failed_key in failed_repair_keys:
-                    warning_codes.append("TERRA_RETRY_FAILED")
-                    warning_reason = " ".join(
-                        part
-                        for part in [
-                            warning_reason,
-                            "Terra retry failed, so the Luna result was kept.",
-                        ]
-                        if part
-                    )
-                candidate_fallback_reason_codes = (
-                    ["TERRA_RETRY_FAILED"]
-                    if failed_key in failed_repair_keys
-                    else fallback_reason_codes
-                    if candidate.extraction_model == settings.openai_fallback_model
-                    else ["TERRA_RETRY_FAILED"]
-                    if "TERRA_RETRY_FAILED" in warning_codes
-                    else []
+                unresolved_code = unresolved_review_codes.get(
+                    (_normalize_title(candidate.title), candidate.event_date)
                 )
+                if unresolved_code:
+                    warning_codes.append(unresolved_code)
+                    warning_reason = " ".join(
+                        part for part in (warning_reason, candidate.derivation_summary) if part
+                    ) or None
                 if candidate.recurring_series_id is not None:
                     series_payload = series_map.get(candidate.recurring_series_id)
                     if series_payload is not None:
@@ -2844,7 +2437,7 @@ def process_job(
                         warning_codes=_ordered_unique(warning_codes),
                         warning_reason=warning_reason,
                         extraction_model=candidate.extraction_model,
-                        fallback_reason_codes=candidate_fallback_reason_codes,
+                        fallback_reason_codes=[],
                         derivation_summary=candidate.derivation_summary,
                         review_status=ReviewStatus.NEEDS_REVIEW,
                     )

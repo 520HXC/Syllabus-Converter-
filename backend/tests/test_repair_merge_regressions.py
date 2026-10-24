@@ -1,109 +1,141 @@
-from datetime import time
+from types import SimpleNamespace
 
-from app.processing import CandidateEvent, SyllabusExtraction, SyllabusRepair, _merge_extractions
+import pymupdf
+import pytest
+
+from app import processing
+from app.errors import PROCESSING_FAILED_MESSAGE
+from app.models import JobStatus, ProcessingJob
+
+from .conftest import auth_headers
 
 
-def event(title, *, date="2026-03-29", end="23:59"):
-    return CandidateEvent(
-        title=title,
-        event_type="assignment",
-        event_date=date,
-        end_time=end,
-        source_quote=f"{title} due March 29.",
-        source_page=1,
-        confidence="high",
-        year_was_explicit=True,
-        extraction_model="primary",
+@pytest.mark.parametrize("malformed", [False, True])
+def test_flagged_or_malformed_primary_result_never_calls_a_second_model(
+    app_client, monkeypatch, malformed,
+):
+    client, app = app_client
+    semester = client.post(
+        "/api/semesters", headers=auth_headers(),
+        json={"name": "Fall 2026", "start_date": "2026-08-24",
+              "end_date": "2026-12-18", "timezone": "America/New_York"},
+    ).json()
+    source = "Final exam December 16, 2026. " * 5
+    with pymupdf.open() as document:
+        page = document.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 72, 520, 760), source)
+        content = document.tobytes()
+    response = client.post(
+        f"/api/semesters/{semester['id']}/syllabi", headers=auth_headers(),
+        files=[("files", ("single-model.pdf", content, "application/pdf"))],
+    )
+    assert response.status_code == 202
+    job_id = response.json()["jobs"][0]["id"]
+    calls = []
+    output = processing.SyllabusExtraction(
+        course_name="Single model regression", events=[processing.CandidateEvent(
+            title="Final exam", event_type="exam", event_date="2026-12-16",
+            source_quote="A quote that does not appear in the syllabus",
+            source_page=1, confidence="low", year_was_explicit=True,
+        )],
     )
 
+    class Responses:
+        def parse(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_parsed=None if malformed else output)
 
-def test_repair_ignores_already_validated_primary_instead_of_duplicating_or_overwriting():
-    homework = event("Homework 8 due")
-    midterm = event("Midterm Exam", end="03:30")
-    primary = SyllabusExtraction(course_name="Brooklyn", events=[homework, midterm])
-    extra_homework = event("Homework 8", end="11:59").model_copy(
-        update={"extraction_model": "repair"}
+    class Client:
+        def __init__(self, **kwargs):
+            self.responses = Responses()
+
+    monkeypatch.setattr(processing, "OpenAI", Client)
+    settings = app.state.settings.model_copy(update={
+        "extraction_mode": "openai", "openai_api_key": "fake-key",
+        "openai_model": "gpt-6.1-sol", "openai_reasoning_effort": "medium",
+    })
+    processing.process_job(job_id, settings=settings, session_factory=app.state.session_factory)
+    assert len(calls) == 1
+    assert calls[0]["model"] == "gpt-6.1-sol"
+    assert calls[0]["reasoning"] == {"effort": "medium"}
+    from uuid import UUID
+
+    with app.state.session_factory() as session:
+        job = session.get(ProcessingJob, UUID(job_id))
+        assert job.fallback_model is None
+        assert job.fallback_used is False
+        assert job.fallback_reason_codes == []
+        if malformed:
+            assert job.status == JobStatus.FAILED
+            assert job.error_message == PROCESSING_FAILED_MESSAGE
+            assert job.document.semester.events == []
+        else:
+            assert job.status == JobStatus.NEEDS_REVIEW
+            event = job.document.semester.events[0]
+            assert event.title == "Final exam"
+            assert event.extraction_model == "gpt-6.1-sol"
+            assert event.warning_codes == ["SOURCE_MISMATCH", "LOW_CONFIDENCE"]
+            assert event.fallback_reason_codes == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_title", "missing_anchor"),
+    [
+        ("Homework is due every Monday.", "Homework", False),
+        ("Exercise set is due every Monday.", "Exercise Sets", False),
+        ("Monday 7 September 2026 Orientation. Homework is due every Friday.",
+         "Homework", False),
+        ("Homework is due every Monday starting Monday 7 September 2026.",
+         "Homework", False),
+        ("Monday 7 September 2026 Orientation. Reflection due two days after lecture.",
+         "Reflection", True),
+    ],
+)
+def test_unresolved_exact_schedule_stays_undated_and_keeps_its_warning(
+    app_client, monkeypatch, source, expected_title, missing_anchor,
+):
+    client, app = app_client
+    semester = client.post(
+        "/api/semesters", headers=auth_headers(),
+        json={"name": "Fall 2026", "start_date": "2026-08-24",
+              "end_date": "2026-12-18", "timezone": "America/New_York"},
+    ).json()
+    with pymupdf.open() as document:
+        page = document.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 72, 520, 760), (source + " ") * 4)
+        content = document.tobytes()
+    response = client.post(
+        f"/api/semesters/{semester['id']}/syllabi", headers=auth_headers(),
+        files=[("files", ("missing-rule.pdf", content, "application/pdf"))],
     )
-    fixed_midterm = event("Midterm Exam", end="15:30").model_copy(
-        update={"extraction_model": "repair"}
-    )
-    repair = SyllabusRepair(events=[extra_homework, fixed_midterm])
-    merged = _merge_extractions(primary, repair, {1}, set())
-    assert len(merged.events) == 2
-    assert merged.events[0] == homework
-    assert merged.events[1].end_time == time(15, 30)
-    assert merged.events[1].extraction_model == "repair"
+    assert response.status_code == 202
+    extraction = processing.SyllabusExtraction(course_name="Missing recurrence")
+    if missing_anchor:
+        extraction.recurring_rules = [processing.RecurringRule(
+            title="Reflection", event_type="assignment", rule_kind="relative_to_anchor",
+            anchor_title="Lecture", offset_days=2, source_page=1, confidence="high",
+            source_quote="Reflection due two days after lecture", expansion_mode="exact",
+        )]
+    monkeypatch.setattr(processing, "extract_with_openai", lambda pages, settings: extraction)
+    settings = app.state.settings.model_copy(update={
+        "extraction_mode": "openai", "openai_api_key": "fake-key",
+        "openai_model": "gpt-6.1-sol",
+    })
+    job_id = response.json()["jobs"][0]["id"]
+    processing.process_job(job_id, settings=settings, session_factory=app.state.session_factory)
+    from uuid import UUID
 
-
-def test_context_aliases_use_existing_canonical_identity_for_protected_events():
-    primary = SyllabusExtraction(course_name="Regression", events=[event("Quick Checks deadline")])
-    merged = _merge_extractions(
-        primary, SyllabusRepair(events=[event("Weekly quick checks")]), set(), set()
-    )
-    assert merged.events == primary.events
-
-
-def test_distinct_items_on_same_date_and_same_title_on_different_date_remain():
-    homework = event("Homework 8 due")
-    quiz = event("Quiz 8")
-    later_homework = event("Homework 8", date="2026-04-12")
-    primary = SyllabusExtraction(course_name="Regression", events=[homework])
-    merged = _merge_extractions(
-        primary, SyllabusRepair(events=[quiz, later_homework]), set(), set()
-    )
-    assert merged.events == [homework, quiz, later_homework]
-
-
-def test_filtered_unrelated_only_repair_preserves_unresolved_target():
-    homework = event("Homework 8 due")
-    target = event("Midterm Exam", end="03:30")
-    primary = SyllabusExtraction(course_name="Regression", events=[homework, target])
-    merged = _merge_extractions(primary, SyllabusRepair(events=[event("Homework 8")]), {1}, set())
-    assert merged.events == [homework, target]
-
-
-def test_same_saved_repair_is_idempotent_after_target_becomes_validated():
-    homework = event("Homework 8 due")
-    midterm = event("Midterm Exam", end="03:30")
-    repair = SyllabusRepair(events=[event("Homework 8"), event("Midterm Exam", end="15:30")])
-    primary = SyllabusExtraction(course_name="Regression", events=[homework, midterm])
-    first = _merge_extractions(primary, repair, {1}, set())
-    second = _merge_extractions(first, repair, set(), set())
-    assert second.events == first.events
-
-
-def test_partial_repair_preserves_each_flagged_item_it_did_not_return():
-    first = event("Quiz 1", end="11:59")
-    second = event("Quiz 2", end="11:59")
-    repaired_first = event("Quiz 1", end="23:59")
-    primary = SyllabusExtraction(course_name="Regression", events=[first, second])
-    merged = _merge_extractions(primary, SyllabusRepair(events=[repaired_first]), {0, 1}, set())
-    assert len(merged.events) == 2
-    assert repaired_first in merged.events
-    assert second in merged.events
-
-
-def test_repair_can_correct_date_when_canonical_target_title_is_unique():
-    target = event("Midterm Exam", date="2026-03-28", end="03:30")
-    repaired = event("Midterm Exam", date="2026-03-29", end="15:30")
-    primary = SyllabusExtraction(course_name="Regression", events=[target])
-    merged = _merge_extractions(primary, SyllabusRepair(events=[repaired]), {0}, set())
-    assert merged.events == [repaired]
-
-
-def test_repair_with_ambiguous_target_keeps_all_original_candidates_for_review():
-    first = event("Homework", date="2026-03-28")
-    second = event("Homework", date="2026-04-04")
-    repair = event("Homework", date="2026-04-11")
-    primary = SyllabusExtraction(course_name="Regression", events=[first, second])
-    merged = _merge_extractions(primary, SyllabusRepair(events=[repair]), {0, 1}, set())
-    assert first in merged.events and second in merged.events and repair in merged.events
-
-
-def test_missing_addition_does_not_delete_an_unrelated_flagged_item():
-    unresolved = event("Midterm Exam", end="03:30")
-    missing = event("Project presentation")
-    primary = SyllabusExtraction(course_name="Regression", events=[unresolved])
-    merged = _merge_extractions(primary, SyllabusRepair(events=[missing]), {0}, set())
-    assert unresolved in merged.events
-    assert missing in merged.events
+    with app.state.session_factory() as session:
+        job = session.get(ProcessingJob, UUID(job_id))
+        assert job.status == JobStatus.NEEDS_REVIEW, job.error_message
+        assert len(job.document.semester.events) == 1
+        event = job.document.semester.events[0]
+        assert event.title == expected_title
+        assert event.event_date is None
+        assert event.recurring_series_id is None
+        assert "DATE_MISSING" in event.warning_codes
+        expected_code = "ANCHOR_NOT_FOUND" if missing_anchor else "RECURRING_RULE_MISSING"
+        assert expected_code in event.warning_codes
+        assert "AMBIGUOUS_RECURRENCE" not in event.warning_codes
+        assert event.extraction_model == "gpt-6.1-sol"
+        assert event.fallback_reason_codes == []
