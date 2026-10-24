@@ -8,7 +8,7 @@ from collections.abc import Callable, Collection
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from time import monotonic
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import pymupdf
@@ -17,7 +17,7 @@ from dateutil import parser as date_parser
 from openai import OpenAI
 from pdf2image import convert_from_bytes
 from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPopplerTimeoutError
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, WithJsonSchema
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
@@ -45,6 +45,16 @@ from .source_times import clock_conflict, normalize_source_clock
 from .storage import StorageService
 
 COURSE_COLORS = ["#0D9488", "#2563EB", "#7C3AED", "#DB2777", "#D97706", "#059669"]
+# Constrain the provider schema while retaining Python time parsing for historical
+# offset-bearing values, which must still pass source validation before storage.
+LocalClock = Annotated[
+    time,
+    WithJsonSchema({
+        "type": "string",
+        "pattern": r"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$",
+        "description": "Local 24-hour clock HH:MM:SS, without a timezone suffix or offset.",
+    }),
+]
 SYLLABUS_TYPO_WARNING = (
     "Syllabus typo. The written date and weekday do not match. "
     "The numeric date was kept."
@@ -142,8 +152,8 @@ class CandidateEvent(BaseModel):
         "assignment", "exam", "quiz", "project", "reading", "class", "deadline", "other"
     ]
     event_date: date | None = None
-    start_time: time | None = None
-    end_time: time | None = None
+    start_time: LocalClock | None = None
+    end_time: LocalClock | None = None
     is_all_day: bool = True
     source_quote: str = Field(min_length=1)
     source_page: int = Field(ge=1)
@@ -170,8 +180,8 @@ class ScheduleAnchor(BaseModel):
     weekday: Literal[
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
     ]
-    start_time: time | None = None
-    end_time: time | None = None
+    start_time: LocalClock | None = None
+    end_time: LocalClock | None = None
     boundary_start: date | None = None
     boundary_end: date | None = None
     exclusion_dates: list[date] = Field(default_factory=list)
@@ -190,8 +200,8 @@ class RecurringRule(BaseModel):
     weekday: Literal[
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
     ] | None = None
-    start_time: time | None = None
-    end_time: time | None = None
+    start_time: LocalClock | None = None
+    end_time: LocalClock | None = None
     is_all_day: bool = True
     boundary_start: date | None = None
     boundary_end: date | None = None
@@ -423,6 +433,15 @@ def extract_with_openai(
             "Extract the course identity and every assessment, deadline, cancellation, "
             "or other exceptional date that belongs on a student's calendar. "
             "Do not include routine class meetings, lecture topics, office hours, or readings. "
+            "Return clock times as local 24-hour HH:MM:SS without Z, UTC conversions, "
+            "or timezone offsets. Use separate start_time and end_time fields for ranges. "
+            "Use only explicitly stated times or directly applicable assessment deadline "
+            "rules. Never infer AM/PM from an ambiguous class schedule or borrow office hours. "
+            "Set unknown times to null. Each source_quote must be one short contiguous "
+            "verbatim excerpt from its cited page. Never combine separate table rows, "
+            "omit intervening text and join the remainder, or append a separate deadline "
+            "policy to an assessment quote. A quote may cite just the assessment row; "
+            "explain separately located deadline policies in derivation_summary instead. "
             "Keep important items whose date is not published yet and set event_date to null. "
             "Extract schedule_anchors for recurring lectures, labs, or discussions. "
             "When the syllabus lists irregular explicit meeting rows or dates for an anchor, "
@@ -434,13 +453,14 @@ def extract_with_openai(
             "the lecture, or Sunday following the lab does not identify every occurrence. "
             "Otherwise use expansion_mode exact. Use the page markers for source_page. "
             "Copy a short exact source_quote. Do not invent dates. "
-            "Return times in 24-hour HH:MM form, preserving source AM/PM. "
+            "Return times in 24-hour HH:MM:SS form, preserving source AM/PM. "
             "Times are local to the semester timezone, without UTC offsets. "
             "Put a range's beginning in start_time and its ending in end_time; "
             "never put a range or a timezone suffix in either field. "
-            "For example 11:59 PM is 23:59, 2-4 PM is 14:00-16:00, "
-            "12 AM is 00:00 and 12 PM is 12:00. Include the time in its source quote "
-            "when possible. Apply universal assignment deadlines only to their stated "
+            "For example 11:59 PM is 23:59:00, 2-4 PM uses start_time 14:00:00 "
+            "and end_time 16:00:00, 12 AM is 00:00:00 and 12 PM is 12:00:00. Include time "
+            "in the quoted excerpt when present, without stitching separate passages. "
+            "Apply universal assignment deadlines only to their stated "
             "assessment scope and preserve explicit exceptions such as exams. "
             "Mark whether the source explicitly states the year. "
             "Use low confidence and explain uncertainty whenever wording is tentative "
@@ -927,6 +947,65 @@ def _has_relative_review_only_phrase(value: str) -> bool:
     return bool(RELATIVE_REVIEW_ONLY_PATTERN.search(value))
 
 
+UNCERTAIN_ASSESSMENT_COUNT_PATTERN = re.compile(
+    r"(?<![\w:/–—-])"
+    r"(?:\d{1,3}\s*(?:[–—-]|\bto\b)\s*\d{1,3}|"
+    r"(?:about|around|approximately|roughly|up to|at least)\s+\d{1,3})"
+    r"\s+(?:(?:weekly|graded|short|recitation|in-class|online|programming)\s+){0,4}"
+    r"(?P<assessment>assignments?|homeworks?|quizzes|quiz|quick\s+checks?|"
+    r"exercise\s+sets?|problem\s+sets?|projects?|exams?|tests?|lab\s+reports?)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_uncertain_assessment_count(rule: RecurringRule, pages: list[dict]) -> bool:
+    quote = rule.source_quote
+    if _normalize_evidence(quote) not in _normalize_evidence(_page_text(rule.source_page, pages)):
+        return False
+
+    def assignment_subject(value: str) -> str | None:
+        subjects = list(re.finditer(
+            r"\blab\s+reports?\b|\bhomeworks?\b|\b(?:exercise|problem)\s+sets?\b",
+            value, re.IGNORECASE,
+        ))
+        if not subjects:
+            return None
+        return "lab_report" if subjects[-1].group().casefold().startswith("lab") else "homework"
+
+    for match in UNCERTAIN_ASSESSMENT_COUNT_PATTERN.finditer(quote):
+        # A date, time, location or problem-number range is not an assessment count.
+        prefix = quote[:match.start()].rsplit("\n", 1)[-1]
+        if re.search(
+            r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|"
+            r"at|hours?|rooms?|problems?|questions?|exercises?)\s*$",
+            prefix, re.IGNORECASE,
+        ):
+            continue
+        assessment = _normalize_phrase(match.group("assessment"))
+        if re.search(r"\b(?:quiz|quizzes|quick checks?)\b", assessment):
+            kind = "quiz"
+        elif re.search(r"\bprojects?\b", assessment):
+            kind = "project"
+        elif re.search(r"\b(?:exams?|tests?)\b", assessment):
+            kind = "exam"
+        else:
+            kind = "assignment"
+        if kind == "assignment":
+            target_subject = assignment_subject(rule.title)
+            counted_subject = assignment_subject(assessment)
+            if counted_subject is None:
+                # Generic "assignments" inherit the closest explicit subject in
+                # the quote, such as UMD's "Homeworks" heading. Different explicit
+                # subjects must not borrow each other's approximate counts.
+                counted_subject = assignment_subject(quote[:match.start()])
+            if counted_subject is not None and counted_subject != target_subject:
+                continue
+        if kind == rule.event_type:
+            return True
+    return False
+
+
 def _rule_requires_review_only(rule: RecurringRule, pages: list[dict]) -> bool:
     related_segments = _related_page_segments(
         title=rule.title,
@@ -938,6 +1017,8 @@ def _rule_requires_review_only(rule: RecurringRule, pages: list[dict]) -> bool:
         _has_relative_review_only_phrase(segment) for segment in related_segments
     )
     if rule.expansion_mode == "review_only":
+        return True
+    if _has_uncertain_assessment_count(rule, pages):
         return True
     if _is_ambiguous_recurrence_text(rule.source_quote):
         return True

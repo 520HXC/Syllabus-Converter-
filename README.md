@@ -38,9 +38,9 @@ flowchart LR
 
 ## AI extraction
 
-New documents use `gpt-6.1-sol` with `medium` reasoning effort. Each processing attempt makes one structured extraction request. There is no secondary model or automatic model repair call.
+New documents use `gpt-6.1-sol` with `medium` reasoning effort. Each processing attempt makes one structured extraction request. There is no secondary model or automatic model repair call. Clock fields are constrained to local `HH:MM:SS` values without timezone suffixes. Unknown times remain unset, and legacy offset-bearing values still require source validation.
 
-Every result is checked by backend rules before it reaches Review. Low confidence, conflicting dates or times, and missing source evidence remain visible for human review. Missing or unresolved recurring schedules are retained as undated Review items instead of silently disappearing. Invalid structured output or a failed API request marks the job as failed so the user can retry it.
+Every result is checked by backend rules before it reaches Review. Low confidence, conflicting dates or times, and missing source evidence remain visible for human review. Missing or unresolved recurring schedules are retained as undated Review items instead of silently disappearing. Approximate or ranged assessment counts remain undated for review even when a weekday is stated. Invalid structured output or a failed API request marks the job as failed so the user can retry it.
 
 The AI identifies recurring rules and their source evidence. Python expands supported weekly and lecture-relative rules into concrete dates, applies exceptions, keeps dates inside the semester, removes duplicates, and limits each series to 200 occurrences.
 
@@ -310,7 +310,7 @@ Production must use Linux Celery prefork with `APP_ENV=production`, `PROCESSING_
 
 Set `MALLOC_ARENA_MAX=2` in the worker process environment before Python starts, as the Docker image and worker command above do. Production startup checks this value. Putting it only in an application `.env` file is insufficient because the C allocator initializes before Python loads that file. This keeps allocator arenas inherited by replacement workers from consuming the address-space budget needed for normal OCR image buffers.
 
-OpenAI requests have a 60-second timeout, no automatic SDK retries, and an 8000-token output cap. Each attempt uses the configured model once with `OPENAI_REASONING_EFFORT=medium` by default. No automatic model fallback is used. Daily job limits bound application usage, not a fixed dollar charge; actual spend depends on configured models and provider pricing. Set provider project spending controls as an additional safeguard.
+OpenAI requests have a 240-second timeout, no automatic SDK retries, and a 16000-token output cap. The production worker still enforces the 300-second total processing deadline. Each attempt uses the configured model once with `OPENAI_REASONING_EFFORT=medium` by default. No automatic model fallback is used. Daily job limits bound application usage, not a fixed dollar charge; actual spend depends on configured models and provider pricing. Set provider project spending controls as an additional safeguard.
 
 Only the current execution may update job stages and replace extracted results. Duplicate or outdated task deliveries are skipped. Internal processing exceptions are replaced with safe user-facing messages, including older saved exception strings. Server diagnostics retain exception type and stack locations without raw provider bodies or document text.
 

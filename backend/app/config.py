@@ -49,8 +49,8 @@ class Settings(BaseSettings):
     max_ocr_dimension_pixels: int = Field(default=4000, gt=0)
     processing_timeout_seconds: int = Field(default=300, gt=10)
     processing_memory_limit_mb: int = Field(default=512, ge=256)
-    openai_timeout_seconds: int = Field(default=60, gt=0)
-    max_model_output_tokens: int = Field(default=8000, gt=0)
+    openai_timeout_seconds: int = Field(default=240, gt=0)
+    max_model_output_tokens: int = Field(default=16000, gt=0)
     max_pdf_pages: int = 200
     max_ocr_pages: int = 50
     max_extracted_text_characters: int = 500_000

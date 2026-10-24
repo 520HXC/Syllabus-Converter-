@@ -431,3 +431,146 @@ def test_combined_numbered_source_covers_second_quiz_and_homework(title):
     assert corrected.start_time == time(23, 59)
     assert corrected.start_time.tzinfo is None
     assert "TIME_CONFLICT" not in validate_candidate(corrected, pages, START, END)[0]
+
+
+FAIRFIELD_HOMEWORK_QUOTE = (
+    "Homework will be due each Wednesday night at 11:59PM, "
+    "with assignments covering the material from\n"
+    "the previous week."
+)
+
+
+def fairfield_homework_rule(title="Weekly homework due on Gradescope", **changes):
+    from app.processing import RecurringRule
+
+    # Replay the provider's offending rule, including its invented UTC suffix.
+    values = dict(
+        title=title,
+        event_type="assignment",
+        rule_kind="weekly_fixed",
+        weekday="wednesday",
+        start_time="23:59:00Z",
+        end_time=None,
+        is_all_day=False,
+        source_quote=FAIRFIELD_HOMEWORK_QUOTE,
+        source_page=2,
+        derivation_summary=(
+            "Fixed Wednesday homework deadline; applies to homework only, not exams. "
+            "First and last homework due dates are not specified."
+        ),
+        confidence=ConfidenceLevel.HIGH,
+    )
+    values.update(changes)
+    return RecurringRule(**values)
+
+
+@pytest.mark.parametrize("title", ["Weekly homework due on Gradescope", "Weekly homework due"])
+def test_real_fairfield_descriptive_weekly_title_recovers_source_local_clock(title):
+    from app.processing import _validate_rule, expand_recurring_rules
+
+    rule = fairfield_homework_rule(title)
+    pages = [{"page": 2, "text": FAIRFIELD_HOMEWORK_QUOTE}]
+    extraction = SyllabusExtraction(course_name="Fairfield", recurring_rules=[rule])
+    corrected = _normalize_explicit_source_event_dates(extraction, START, END, pages)
+    saved = corrected.recurring_rules[0]
+    assert saved.start_time == time(23, 59)
+    assert saved.end_time is None
+    assert saved.start_time.tzinfo is None
+    assert "TIME_CONFLICT" not in _validate_rule(saved, pages, [])[0]
+    assert rule.derivation_summary in saved.derivation_summary
+    assert "page 2" in saved.derivation_summary and "11:59PM" in saved.derivation_summary
+    _, occurrences = expand_recurring_rules(
+        anchors=[],
+        rules=[saved],
+        semester_start=START,
+        semester_end=END,
+        explicit_events=[],
+        extraction_model=None,
+    )
+    assert occurrences and all(item.start_time == time(23, 59) for item in occurrences)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"source_quote": "Office hours for homework are each Wednesday at 11:59PM."},
+        {"source_quote": "Homework will be due each Wednesday. Lectures meet at 11:59PM."},
+        {"source_quote": "Homework will be due each Wednesday, with Quiz 1 at 11:59PM."},
+        {"source_quote": "Homework 1 will be due each Wednesday at 11:59PM."},
+        {"source_quote": "Homework will be due each Wednesday at 11:59PM or 11:59AM."},
+        {"source_quote": "Homework will be due each Wednesday at 11:59."},
+        {
+            "source_quote": "Homework will be due each Wednesday at 9:30-10:20.",
+            "start_time": "09:30:00Z",
+        },
+        {"source_quote": "Homework will be due each Wednesday at 11:59PM unless stated otherwise."},
+        {"weekday": "thursday"},
+        {"event_type": "exam"},
+        {"title": "Weekly homework 1 due"},
+        {"title": "Weekly project due"},
+    ],
+)
+def test_descriptive_weekly_title_does_not_remove_offsets_without_applicable_clock(changes):
+    from app.processing import _validate_rule
+
+    rule = fairfield_homework_rule(**changes)
+    pages = [{"page": 2, "text": rule.source_quote}]
+    extraction = SyllabusExtraction(course_name="Adversarial", recurring_rules=[rule])
+    corrected = _normalize_explicit_source_event_dates(extraction, START, END, pages)
+    assert corrected.recurring_rules[0].start_time == rule.start_time
+    assert "TIME_CONFLICT" in _validate_rule(corrected.recurring_rules[0], pages, [])[0]
+
+
+def test_descriptive_weekly_title_does_not_trust_fabricated_source():
+    from app.source_times import normalize_source_clock
+
+    rule = fairfield_homework_rule()
+    assert normalize_source_clock(rule, [{"page": 2, "text": "Homework dates are TBD."}]) == rule
+
+
+def test_fairfield_weekly_source_clock_survives_processing_and_persistence(app_client, monkeypatch):
+    import pymupdf
+
+    from app.processing import process_job
+
+    from .conftest import auth_headers
+
+    client, app = app_client
+    rule = fairfield_homework_rule()
+    monkeypatch.setattr(
+        "app.processing.extract_locally",
+        lambda pages: SyllabusExtraction(course_name="Fairfield replay", recurring_rules=[rule]),
+    )
+    semester = client.post(
+        "/api/semesters",
+        headers=auth_headers(),
+        json={
+            "name": "Spring 2026",
+            "start_date": START.isoformat(),
+            "end_date": END.isoformat(),
+            "timezone": "America/New_York",
+        },
+    ).json()
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((50, 50), "Fairfield replay test")
+        page = pdf.new_page()
+        page.insert_textbox((50, 50, 545, 300), FAIRFIELD_HOMEWORK_QUOTE)
+        data = pdf.tobytes()
+    uploaded = client.post(
+        f"/api/semesters/{semester['id']}/syllabi",
+        headers=auth_headers(),
+        files=[("files", ("fairfield-replay.pdf", data, "application/pdf"))],
+    )
+    assert uploaded.status_code == 202
+    process_job(
+        uploaded.json()["jobs"][0]["id"],
+        settings=app.state.settings,
+        session_factory=app.state.session_factory,
+    )
+    review = client.get(f"/api/semesters/{semester['id']}/review", headers=auth_headers()).json()
+    assert review["events"]
+    for saved in review["events"]:
+        assert saved["start_time"] == "23:59:00"
+        assert saved["end_time"] is None
+        assert "TIME_CONFLICT" not in saved["warning_codes"]
+    assert "11:59PM" in review["recurring_series"][0]["rule_payload"]["derivation_summary"]

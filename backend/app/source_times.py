@@ -166,11 +166,46 @@ def _owned_quote(candidate: Any, page_text: str) -> str | None:
         )
     if len(owners) > 1 or any("office" in owner.group(0).casefold() for owner in owners):
         return None
-    # An exact event title is necessary for otherwise unrecognized assessment labels.
+    # A descriptive weekly title can differ from the source subject. Bind only a
+    # generic weekly assessment, its actual weekday, and an immediately due clock.
+    # Numbered assessments and other schedule owners must keep exact ownership.
     if _compact(title) not in _compact(quote):
-        return None
+        return _weekly_deadline_quote(candidate, quote) if not owners else None
     title_start = _compact(quote).find(_compact(title))
     return _first_statement(quote[title_start:])
+
+
+def _weekly_deadline_quote(candidate: Any, quote: str) -> str | None:
+    if getattr(candidate, "rule_kind", None) != "weekly_fixed":
+        return None
+    title = re.fullmatch(
+        r"weekly (?P<kind>homework|assignments?|quizzes|projects?)"
+        r"(?: due(?: (?:on|via) [\w.-]+)?)?",
+        _compact(candidate.title),
+    )
+    if title is None:
+        return None
+    kind = title.group("kind")
+    expected_type = (
+        "quiz" if kind == "quizzes" else "project" if kind.startswith("project") else "assignment"
+    )
+    weekday = getattr(candidate, "weekday", None)
+    if candidate.event_type != expected_type or not weekday:
+        return None
+    statement = _first_statement(quote)
+    if re.search(r"\b(?:except|excluding|unless|other than|if)\b", statement, re.I):
+        return None
+    deadline = re.match(
+        re.escape(kind)
+        + r"\s+(?:will be|is|are)\s+due\s+(?:each|every)\s+"
+        + re.escape(weekday)
+        + r"(?:\s+(?:night|morning|afternoon|evening))?\s+(?:at|by)\s+"
+        + _CLOCK.replace("{prefix}", "a")
+        + r"(?!\w)",
+        statement,
+        re.I,
+    )
+    return statement if deadline and _clock(deadline, "a") is not None else None
 
 
 def source_clocks(candidate: Any, pages: list[dict]) -> list[SourceClock]:
